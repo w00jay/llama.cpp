@@ -352,6 +352,24 @@ pre-converts to FP16 via the dequantize path (fattn-common.cuh:965-1010).
 This works automatically if `to_float` is implemented. Initial implementation
 can rely on this fallback; fused kernels are an optimization for later.
 
+**Phase 3 Results (completed 2026-04-12):**
+- Dequantize device functions added to `tbq-quants.cuh`:
+  `dequantize_f32_tbq3_0_block` and `dequantize_f32_tbq4_0_block`
+- QJL reconstruction uses O(d^2) column-wise loop (vs O(d^3) naive loop in CPU code)
+- CUDA kernels `k_dequantize_row_tbq3_0` / `k_dequantize_row_tbq4_0` added to `convert.cu`
+  — one thread per TBQ block, `block_in_row = flat_idx % blocks_per_row` (= 0 for head_dim=128)
+- Registered in `ggml_get_to_fp16_cuda` (TBQ3_0 → fp16, TBQ4_0 → fp16)
+- TBQ3_0 and TBQ4_0 added to type allowlist in `ggml_cuda_get_best_fattn_kernel` (fattn.cu)
+- Routed to MMA_F16 (Ampere/Turing) or TILE (older GPU), never VEC (which has no TBQ dispatch)
+- Guards: mask->ne[2]!=1 check, non-contiguous K/V check (nc dequant not yet implemented)
+- TBQ flash attention test cases added to test-backend-ops.cpp (decoding + prefill shapes)
+- Build clean, 0 FAIL on test-backend-ops FLASH_ATTN_EXT (CUDA backend skipped in env without GPU)
+- Files: tbq-quants.cuh, convert.cu, fattn.cu, test-backend-ops.cpp (+210 lines)
+
+**Implementation note:** Phase 3 uses the fallback fp16 pre-conversion path. The TILE and MMA
+kernels receive K/V already converted to fp16 and operate on that. The TBQ dequant is done
+once per forward pass (not fused with the attention kernel). Fused kernels are Phase 5.
+
 **Exit criteria:** Flash attention with TBQ3_0 K/V produces correct output on GPU.
 Benchmark: measure tokens/sec vs Q4_0 KV cache and FP16 KV cache.
 

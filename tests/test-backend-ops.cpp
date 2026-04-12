@@ -7400,6 +7400,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_set_rows(tbq_type, GGML_TYPE_I64, { 128, 5, 2, 1 }, { 1, 1 }, 1, false));
     }
 
+    // TBQ flash attention: Phase 3 read path — KV cache with TBQ quantization.
+    // hsk=hsv=128 (QK_TBQ=128), use small KV and NQ counts for a fast test.
+    // mask=false: avoids mask->ne[2]!=1 restriction in ggml_cuda_get_best_fattn_kernel.
+    for (ggml_type tbq_type : {GGML_TYPE_TBQ3_0, GGML_TYPE_TBQ4_0}) {
+        // Decoding: NQ=1 (single-token generation)
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 128, 1, false, false, 0.0f, 0.0f, GGML_PREC_F32, tbq_type));
+        // Prefill: NQ=8
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 128, 8, false, false, 0.0f, 0.0f, GGML_PREC_F32, tbq_type));
+    }
+
     for (int mode : { GGML_ROPE_TYPE_NORMAL, GGML_ROPE_TYPE_NEOX, GGML_ROPE_TYPE_MROPE, GGML_ROPE_TYPE_VISION }) {
         for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
             for (int ne2 : {1, 8, 512}) {

@@ -67,7 +67,9 @@ g++ -std=c++17 -O2 -o test-tbq-math tests/test-tbq-math.cpp -lm && ./test-tbq-ma
   registered. CPU quantize/dequantize/vec_dot implemented. Builds clean, roundtrip verified.
 - **Phase 2** — DONE. CUDA write path: `tbq-quants.cuh` device functions + custom
   `k_set_rows_tbq` kernel. All SET_ROWS tests pass (GPU matches CPU bit-exact).
-- **Phase 3** — Pending. CUDA read path (flash attention).
+- **Phase 3** — DONE. CUDA read path (flash attention). TBQ K/V dequantized to fp16 via
+  `dequantize_row_tbq3_0/4_0_cuda`, routed to MMA/TILE kernels in fattn.cu. Build clean,
+  0 test failures. Files: tbq-quants.cuh, convert.cu, fattn.cu, test-backend-ops.cpp.
 - **Phase 4** — Pending. Benchmarks.
 - **Phase 5** — Pending. Optimization.
 

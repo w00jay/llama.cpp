@@ -118,7 +118,7 @@ static __device__ void quantize_f32_tbq3_0_block(const float * __restrict__ x,
             y->qjl[j / 8] |= (1 << (j % 8));
         }
     }
-}
+}  // end quantize_f32_tbq3_0_block
 
 // --- TBQ4_0: 3-bit Lloyd-Max + 1-bit QJL = 4.25 bpw ---
 
@@ -202,5 +202,123 @@ static __device__ void quantize_f32_tbq4_0_block(const float * __restrict__ x,
         if (proj >= 0.0f) {
             y->qjl[j / 8] |= (1 << (j % 8));
         }
+    }
+}  // end quantize_f32_tbq4_0_block
+
+// --- TBQ dequantize device functions ---
+// Each call reconstructs one QK_TBQ-element vector from a single TBQ block.
+// block_idx must match what was passed during quantization (same PRNG seeds).
+
+static __device__ void dequantize_f32_tbq3_0_block(const block_tbq3_0 * __restrict__ x,
+                                                     float * __restrict__ y,
+                                                     int64_t block_idx) {
+    const float cb[4] = { -1.335033e-01f, -4.002048e-02f, 4.002048e-02f, 1.335033e-01f };
+    const float d_norm = __half2float(x->d);
+    const float gamma  = __half2float(x->gamma);
+
+    float tmp[QK_TBQ];
+
+    // Step 1: reconstruct from 2-bit centroid indices
+    for (int j = 0; j < QK_TBQ; j++) {
+        int idx = (x->idx[j / 4] >> (2 * (j % 4))) & 3;
+        tmp[j] = cb[idx];
+    }
+
+    // Step 2: QJL reconstruction — compute S^T * qjl_signs column-wise (O(d^2))
+    float acc[QK_TBQ];
+    for (int j = 0; j < QK_TBQ; j++) acc[j] = 0.0f;
+
+    for (int l = 0; l < QK_TBQ; l++) {
+        float sign = ((x->qjl[l / 8] >> (l % 8)) & 1) ? 1.0f : -1.0f;
+        uint64_t srng = tbq_qjl_seed_cuda(block_idx, l);
+        for (int j = 0; j < QK_TBQ; j++) {
+            srng = tbq_xorshift64_cuda(srng);
+            float s_lj = (srng & 1) ? 1.0f : -1.0f;
+            acc[j] += s_lj * sign;
+        }
+    }
+
+    const float qjl_scale = sqrtf((float)M_PI / 2.0f) / (float)QK_TBQ * gamma;
+    for (int j = 0; j < QK_TBQ; j++) {
+        tmp[j] += qjl_scale * acc[j];
+    }
+
+    // Step 3: inverse randomized Hadamard (FWHT then undo sign-flip)
+    const float scale = 1.0f / sqrtf((float)QK_TBQ);
+    for (int j = 0; j < QK_TBQ; j++) tmp[j] *= scale;
+
+    tbq_fwht_inplace_cuda(tmp, QK_TBQ);
+
+    uint64_t rng = tbq_rot_seed_cuda(block_idx);
+    for (int j = 0; j < QK_TBQ; j++) {
+        rng = tbq_xorshift64_cuda(rng);
+        if (rng & 1) tmp[j] = -tmp[j];
+    }
+
+    // Step 4: scale by vector norm
+    for (int j = 0; j < QK_TBQ; j++) {
+        y[j] = d_norm * tmp[j];
+    }
+}
+
+static __device__ void dequantize_f32_tbq4_0_block(const block_tbq4_0 * __restrict__ x,
+                                                     float * __restrict__ y,
+                                                     int64_t block_idx) {
+    const float cb[8] = {
+        -1.902069e-01f, -1.187859e-01f, -6.682206e-02f, -2.166347e-02f,
+         2.166347e-02f,  6.682206e-02f,  1.187859e-01f,  1.902069e-01f,
+    };
+    const float d_norm = __half2float(x->d);
+    const float gamma  = __half2float(x->gamma);
+
+    float tmp[QK_TBQ];
+
+    // Step 1: reconstruct from 3-bit centroid indices
+    for (int j = 0; j < QK_TBQ; j++) {
+        int bit_pos  = j * 3;
+        int byte_pos = bit_pos / 8;
+        int bit_off  = bit_pos % 8;
+        int idx      = (x->idx[byte_pos] >> bit_off);
+        if (bit_off + 3 > 8) {
+            idx |= ((int)x->idx[byte_pos + 1] << (8 - bit_off));
+        }
+        idx &= 7;
+        tmp[j] = cb[idx];
+    }
+
+    // Step 2: QJL reconstruction — compute S^T * qjl_signs column-wise (O(d^2))
+    float acc[QK_TBQ];
+    for (int j = 0; j < QK_TBQ; j++) acc[j] = 0.0f;
+
+    for (int l = 0; l < QK_TBQ; l++) {
+        float sign = ((x->qjl[l / 8] >> (l % 8)) & 1) ? 1.0f : -1.0f;
+        uint64_t srng = tbq_qjl_seed_cuda(block_idx, l);
+        for (int j = 0; j < QK_TBQ; j++) {
+            srng = tbq_xorshift64_cuda(srng);
+            float s_lj = (srng & 1) ? 1.0f : -1.0f;
+            acc[j] += s_lj * sign;
+        }
+    }
+
+    const float qjl_scale = sqrtf((float)M_PI / 2.0f) / (float)QK_TBQ * gamma;
+    for (int j = 0; j < QK_TBQ; j++) {
+        tmp[j] += qjl_scale * acc[j];
+    }
+
+    // Step 3: inverse randomized Hadamard (FWHT then undo sign-flip)
+    const float scale = 1.0f / sqrtf((float)QK_TBQ);
+    for (int j = 0; j < QK_TBQ; j++) tmp[j] *= scale;
+
+    tbq_fwht_inplace_cuda(tmp, QK_TBQ);
+
+    uint64_t rng = tbq_rot_seed_cuda(block_idx);
+    for (int j = 0; j < QK_TBQ; j++) {
+        rng = tbq_xorshift64_cuda(rng);
+        if (rng & 1) tmp[j] = -tmp[j];
+    }
+
+    // Step 4: scale by vector norm
+    for (int j = 0; j < QK_TBQ; j++) {
+        y[j] = d_norm * tmp[j];
     }
 }

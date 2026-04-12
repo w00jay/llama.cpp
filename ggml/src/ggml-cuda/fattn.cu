@@ -392,6 +392,27 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_BF16:
             break;
+        // TBQ types: supported via fp16 pre-conversion fallback path (Phase 3).
+        // The VEC kernel has no TBQ specializations; route to TILE or MMA which
+        // always pre-convert K/V to fp16 via ggml_get_to_fp16_cuda first.
+        case GGML_TYPE_TBQ3_0:
+        case GGML_TYPE_TBQ4_0: {
+            // Apply the same mask restriction as the general path.
+            if (mask && mask->ne[2] != 1) {
+                return BEST_FATTN_KERNEL_NONE;
+            }
+            // TBQ only has a contiguous dequant kernel; non-contiguous K/V
+            // would require a strided dequant path not yet implemented.
+            if (!ggml_is_contiguously_allocated(K) || !ggml_is_contiguously_allocated(V)) {
+                return BEST_FATTN_KERNEL_NONE;
+            }
+            // Route to MMA (Ampere/Turing) or TILE (older), never VEC.
+            // Both kernels pre-convert TBQ→fp16 via ggml_get_to_fp16_cuda.
+            if (turing_mma_available(cc) && K->ne[0] != 40 && K->ne[0] != 72) {
+                return BEST_FATTN_KERNEL_MMA_F16;
+            }
+            return BEST_FATTN_KERNEL_TILE;
+        }
         default:
             return BEST_FATTN_KERNEL_NONE;
     }

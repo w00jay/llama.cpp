@@ -1,5 +1,6 @@
 #include "convert.cuh"
 #include "dequantize.cuh"
+#include "tbq-quants.cuh"
 
 #include <cstdint>
 
@@ -698,6 +699,61 @@ static void convert_unary_cont_cuda(const void * vx, dst_t * y, const int64_t k,
     convert_unary_cuda<src_t>(vx, y, k, 1, 1, 1, k, k, k, stream);
 }
 
+// --- TBQ dequantize CUDA kernels (one thread per TBQ block) ---
+//
+// TBQ uses QK_TBQ=128 which equals the standard head dimension, so there is
+// always exactly one TBQ block per KV vector.  The quantize kernel (set-rows.cu)
+// passes block_idx = i00/QK_TBQ = 0 for every vector.  Dequantization must
+// use the same block_idx so the PRNG seeds match.  We compute:
+//   within_row_block_idx = blockIdx.x % blocks_per_row
+// where blocks_per_row = ne0 / QK_TBQ.  Because ne0=128=QK_TBQ always for
+// TBQ, blocks_per_row=1 and within_row_block_idx=0 always.  We accept
+// blocks_per_row as a kernel argument for clarity (always 1 in practice).
+
+template<typename dst_t>
+static __global__ void k_dequantize_row_tbq3_0(const void * __restrict__ vx,
+                                                 dst_t * __restrict__ y,
+                                                 int blocks_per_row) {
+    const int64_t flat_idx      = (int64_t)blockIdx.x;
+    const int64_t block_in_row  = flat_idx % blocks_per_row;   // 0 always for TBQ
+    const block_tbq3_0 * x = (const block_tbq3_0 *)vx + flat_idx;
+    float tmp[QK_TBQ];
+    dequantize_f32_tbq3_0_block(x, tmp, block_in_row);
+    dst_t * y_block = y + flat_idx * QK_TBQ;
+    for (int j = 0; j < QK_TBQ; j++) {
+        y_block[j] = (dst_t)tmp[j];
+    }
+}
+
+template<typename dst_t>
+static __global__ void k_dequantize_row_tbq4_0(const void * __restrict__ vx,
+                                                 dst_t * __restrict__ y,
+                                                 int blocks_per_row) {
+    const int64_t flat_idx      = (int64_t)blockIdx.x;
+    const int64_t block_in_row  = flat_idx % blocks_per_row;   // 0 always for TBQ
+    const block_tbq4_0 * x = (const block_tbq4_0 *)vx + flat_idx;
+    float tmp[QK_TBQ];
+    dequantize_f32_tbq4_0_block(x, tmp, block_in_row);
+    dst_t * y_block = y + flat_idx * QK_TBQ;
+    for (int j = 0; j < QK_TBQ; j++) {
+        y_block[j] = (dst_t)tmp[j];
+    }
+}
+
+template<typename dst_t>
+static void dequantize_row_tbq3_0_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    const int nb             = (int)(k / QK_TBQ);
+    const int blocks_per_row = 1;  // QK_TBQ == head_dim == 128, always 1 block/row
+    k_dequantize_row_tbq3_0<<<nb, 1, 0, stream>>>(vx, y, blocks_per_row);
+}
+
+template<typename dst_t>
+static void dequantize_row_tbq4_0_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    const int nb             = (int)(k / QK_TBQ);
+    const int blocks_per_row = 1;  // QK_TBQ == head_dim == 128, always 1 block/row
+    k_dequantize_row_tbq4_0<<<nb, 1, 0, stream>>>(vx, y, blocks_per_row);
+}
+
 to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
     switch (type) {
         case GGML_TYPE_F32:
@@ -760,6 +816,10 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return convert_unary_cont_cuda<float>;
         case GGML_TYPE_BF16:
             return convert_unary_cont_cuda<nv_bfloat16>;
+        case GGML_TYPE_TBQ3_0:
+            return dequantize_row_tbq3_0_cuda;
+        case GGML_TYPE_TBQ4_0:
+            return dequantize_row_tbq4_0_cuda;
         default:
             return nullptr;
     }
