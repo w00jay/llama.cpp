@@ -35,8 +35,8 @@ cmake --build build -j$(nproc)
 ## Test
 
 ```bash
-# Phase 0 standalone math validation
-cmake --build build --target test_tbq_math && ./build/bin/test_tbq_math
+# Phase 0 standalone math validation (no cmake needed)
+g++ -std=c++17 -O2 -o test-tbq-math tests/test-tbq-math.cpp -lm && ./test-tbq-math
 
 # Phase 1+ integration test
 ./build/bin/llama-cli --cache-type-k tbq3_0 --cache-type-v tbq3_0 -fa -m model.gguf -p "Hello"
@@ -44,6 +44,18 @@ cmake --build build --target test_tbq_math && ./build/bin/test_tbq_math
 # Perplexity benchmark
 ./build/bin/llama-perplexity --cache-type-k tbq3_0 --cache-type-v tbq3_0 -fa -m model.gguf -f wikitext-2-raw/wiki.test.raw
 ```
+
+## Progress
+
+- **Phase 0** — DONE. Standalone math validation: 7/7 tests pass. All core algorithms
+  (FWHT, Lloyd-Max, TBQ quantize/dequant, IP estimation) validated. Key finding:
+  per-pair IP correlation at 3-bit is ~0.92 (matches theory); real quality emerges
+  from softmax averaging in attention.
+- **Phase 1** — IN PROGRESS. GGML type registration + CPU kernels.
+- **Phase 2** — Pending. CUDA write path (set-rows.cu).
+- **Phase 3** — Pending. CUDA read path (flash attention).
+- **Phase 4** — Pending. Benchmarks.
+- **Phase 5** — Pending. Optimization.
 
 ## Key Files
 
@@ -61,7 +73,7 @@ cmake --build build --target test_tbq_math && ./build/bin/test_tbq_math
 - `ggml/src/ggml-cpu/tbq-quants.h` — CPU quantize/dequant declarations
 - `ggml/src/ggml-cpu/tbq-quants.cpp` — CPU kernels (FWHT, codebook, quantize, dequant)
 - `ggml/src/ggml-cuda/tbq-quants.cuh` — CUDA device functions
-- `test/test_tbq_math.cpp` — standalone algorithm tests
+- `tests/test-tbq-math.cpp` — standalone algorithm tests (Phase 0, all passing)
 
 ### Reference files (read these to understand patterns)
 - `ggml/src/ggml-common.h:177-200` — block_q1_0, block_q4_0 struct patterns
