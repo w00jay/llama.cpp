@@ -14,6 +14,18 @@ Upstream is tracked via the `upstream` remote for rebasing.
 Read [PLAN.md](PLAN.md) before starting any work. It contains the full
 implementation plan with phases, file targets, struct layouts, and algorithms.
 
+## Workflow (follow for each phase)
+
+1. **Read PLAN.md** — understand the phase goals, files to modify, and exit criteria
+2. **Read existing code** — study the reference files and patterns before writing
+3. **Implement** — write the code, mirroring existing conventions
+4. **Build** — `cmake --build build -j$(nproc)` and fix any errors
+5. **Test** — run relevant tests (`test-backend-ops`, `test-quantize-fns`, etc.)
+6. **Fix failures** — diagnose, fix, rebuild, retest until all pass
+7. **Update docs** — update Progress in this file + Phase Results in PLAN.md
+8. **Commit** — descriptive message with `turboquant:` prefix
+9. **Push** — `git push origin turboquant`
+
 ## Key Architecture Decisions
 
 - **Rotation:** Randomized Hadamard transform (sign-flip + FWHT), NOT random
