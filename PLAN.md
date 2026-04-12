@@ -238,6 +238,20 @@ Need to verify and add a clear error message for models with non-128 head dims.
 **Exit criteria:** `llama-cli --cache-type-k tbq3_0 -fa -m model.gguf -p "test"` runs
 on CPU and produces coherent output. Perplexity within 0.5 of Q4_0 KV cache baseline.
 
+**Phase 1 Results (completed 2026-04-11):**
+- All types registered and building clean (CPU-only, all targets)
+- block_tbq3_0: 52 bytes / 128 elements (3.25 bpw), block_tbq4_0: 68 bytes (4.25 bpw)
+- GGML_TYPE_TBQ3_0 = 42, GGML_TYPE_TBQ4_0 = 43
+- Roundtrip test passes: quantize→dequantize max_err=0.55 on linear ramp input
+- Lloyd-Max codebooks hardcoded as static const tables (4 centroids for TBQ3, 8 for TBQ4)
+- QJL uses Rademacher rows via xorshift64, seeded per (block_idx, coord)
+- vec_dot uses simple dequantize-then-dot (optimization deferred to Phase 5)
+- 10 files modified, +456 lines total
+
+**Note:** Full end-to-end test with a model not yet done — requires flash attention
+support (Phase 3) since quantized V cache mandates FA in llama.cpp. CPU-only non-FA
+path works for K cache but V cache will error without FA.
+
 ---
 
 ### Phase 2: CUDA Quantization Kernel (write path)
