@@ -51,7 +51,8 @@ g++ -std=c++17 -O2 -o test-tbq-math tests/test-tbq-math.cpp -lm && ./test-tbq-ma
   (FWHT, Lloyd-Max, TBQ quantize/dequant, IP estimation) validated. Key finding:
   per-pair IP correlation at 3-bit is ~0.92 (matches theory); real quality emerges
   from softmax averaging in attention.
-- **Phase 1** — IN PROGRESS. GGML type registration + CPU kernels.
+- **Phase 1** — DONE. GGML types TBQ3_0 (52 bytes/128 elem) and TBQ4_0 (68 bytes/128 elem)
+  registered. CPU quantize/dequantize/vec_dot implemented. Builds clean, roundtrip verified.
 - **Phase 2** — Pending. CUDA write path (set-rows.cu).
 - **Phase 3** — Pending. CUDA read path (flash attention).
 - **Phase 4** — Pending. Benchmarks.

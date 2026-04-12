@@ -112,6 +112,18 @@ void quantize_row_tq2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, 
     quantize_row_tq2_0_ref(x, y, k);
 }
 
+void quantize_row_tbq3_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    assert(k % QK_TBQ == 0);
+    block_tbq3_0 * GGML_RESTRICT y = vy;
+    quantize_row_tbq3_0_ref(x, y, k);
+}
+
+void quantize_row_tbq4_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    assert(k % QK_TBQ == 0);
+    block_tbq4_0 * GGML_RESTRICT y = vy;
+    quantize_row_tbq4_0_ref(x, y, k);
+}
+
 //===================================== Q8_K ==============================================
 
 void quantize_row_q8_K_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
@@ -500,6 +512,68 @@ void ggml_vec_dot_tq2_0_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, 
         const float d = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d);
 
         sumf += (float) sumi * d;
+    }
+
+    *s = sumf;
+}
+
+// TurboQuant vec_dot: dequantize TBQ block, then dot with Q8_0 block.
+// This is the simple reference path; optimized version would compute in rotated domain.
+void ggml_vec_dot_tbq3_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_tbq3_0 * GGML_RESTRICT x = vx;
+    const block_q8_0   * GGML_RESTRICT y = vy;
+
+    // n = total number of elements
+    // TBQ block = 128 elements, Q8_0 block = 32 elements
+    // For each TBQ block, there are 4 Q8_0 blocks
+    const int nb_tbq = n / QK_TBQ;
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb_tbq; i++) {
+        float tmp[QK_TBQ];
+        dequantize_row_tbq3_0(x + i, tmp, QK_TBQ);
+
+        // Dot with the corresponding 4 Q8_0 blocks
+        for (int j = 0; j < QK_TBQ; j++) {
+            int q8_block = (i * QK_TBQ + j) / QK8_0;
+            int q8_idx   = j % QK8_0;
+            float yd = GGML_CPU_FP16_TO_FP32(y[q8_block].d);
+            sumf += tmp[j] * ((float)y[q8_block].qs[q8_idx] * yd);
+        }
+    }
+
+    *s = sumf;
+}
+
+void ggml_vec_dot_tbq4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_tbq4_0 * GGML_RESTRICT x = vx;
+    const block_q8_0   * GGML_RESTRICT y = vy;
+
+    const int nb_tbq = n / QK_TBQ;
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb_tbq; i++) {
+        float tmp[QK_TBQ];
+        dequantize_row_tbq4_0(x + i, tmp, QK_TBQ);
+
+        for (int j = 0; j < QK_TBQ; j++) {
+            int q8_block = (i * QK_TBQ + j) / QK8_0;
+            int q8_idx   = j % QK8_0;
+            float yd = GGML_CPU_FP16_TO_FP32(y[q8_block].d);
+            sumf += tmp[j] * ((float)y[q8_block].qs[q8_idx] * yd);
+        }
     }
 
     *s = sumf;
