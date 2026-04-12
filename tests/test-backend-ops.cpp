@@ -2358,6 +2358,11 @@ struct test_set_rows : public test_case {
     }
 
     double max_nmse_err() override {
+        if (type == GGML_TYPE_TBQ3_0 || type == GGML_TYPE_TBQ4_0) {
+            // TBQ has high quantization error by design (3-4 bits with rotation).
+            // CPU vs GPU should match closely; threshold accounts for FP rounding.
+            return 1e-4;
+        }
         if (type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_1 || type == GGML_TYPE_IQ4_NL ||
             type == GGML_TYPE_Q5_0 || type == GGML_TYPE_Q5_1 || type == GGML_TYPE_Q8_0) {
             // estimate what the max nmse error would be if one quantized value is
@@ -7386,6 +7391,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 }
             }
         }
+    }
+
+    // TBQ set_rows: block size 128, test basic and broadcast cases
+    for (ggml_type tbq_type : {GGML_TYPE_TBQ3_0, GGML_TYPE_TBQ4_0}) {
+        test_cases.emplace_back(new test_set_rows(tbq_type, GGML_TYPE_I64, { 128, 5, 1, 1 }, { 1, 1 }, 1, false));
+        test_cases.emplace_back(new test_set_rows(tbq_type, GGML_TYPE_I64, { 256, 3, 1, 1 }, { 1, 1 }, 2, false));
+        test_cases.emplace_back(new test_set_rows(tbq_type, GGML_TYPE_I64, { 128, 5, 2, 1 }, { 1, 1 }, 1, false));
     }
 
     for (int mode : { GGML_ROPE_TYPE_NORMAL, GGML_ROPE_TYPE_NEOX, GGML_ROPE_TYPE_MROPE, GGML_ROPE_TYPE_VISION }) {

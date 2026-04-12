@@ -2722,6 +2722,18 @@ void dequantize_row_tbq4_0(const block_tbq4_0 * GGML_RESTRICT x, float * GGML_RE
     }
 }
 
+size_t quantize_tbq3_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    quantize_row_tbq3_0_ref(src, dst, nrow * n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_TBQ3_0, n_per_row);
+}
+
+size_t quantize_tbq4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    quantize_row_tbq4_0_ref(src, dst, nrow * n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_TBQ4_0, n_per_row);
+}
+
 // ====================== "True" 2-bit (de)-quantization
 
 void dequantize_row_iq2_xxs(const block_iq2_xxs * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {

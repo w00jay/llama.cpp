@@ -292,6 +292,21 @@ Add to `ggml_cuda_op_set_rows`:
 
 **Exit criteria:** GPU quantization produces identical results to CPU reference.
 
+**Phase 2 Results (completed 2026-04-12):**
+- CUDA device functions in `tbq-quants.cuh` — single-threaded per block, mirrors CPU
+- Custom `k_set_rows_tbq` kernel passes block_idx for deterministic PRNG seeding
+- TBQ types added to `ggml_cuda_supports_op` SET_ROWS allowlist in ggml-cuda.cu
+- `quantize_tbq3_0`/`quantize_tbq4_0` wrappers added for `ggml_quantize_chunk`
+- All 6 TBQ SET_ROWS tests pass on CUDA (ne=128 and ne=256, both types)
+- 143/143 total SET_ROWS tests pass (no regressions)
+- GPU output is bit-exact with CPU reference (NMSE < 1e-4 threshold)
+- Files: tbq-quants.cuh (new), set-rows.cu, ggml-cuda.cu, ggml.c, ggml-quants.c/h,
+  test-backend-ops.cpp
+
+**Performance note:** Current kernel is single-threaded per block (~16K PRNG ops for
+QJL inner loop). This is slow but correct. Phase 5 will optimize with cooperative
+threads and shared memory FWHT.
+
 ---
 
 ### Phase 3: CUDA Flash Attention Kernels (read path)

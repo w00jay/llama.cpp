@@ -53,7 +53,8 @@ g++ -std=c++17 -O2 -o test-tbq-math tests/test-tbq-math.cpp -lm && ./test-tbq-ma
   from softmax averaging in attention.
 - **Phase 1** — DONE. GGML types TBQ3_0 (52 bytes/128 elem) and TBQ4_0 (68 bytes/128 elem)
   registered. CPU quantize/dequantize/vec_dot implemented. Builds clean, roundtrip verified.
-- **Phase 2** — Pending. CUDA write path (set-rows.cu).
+- **Phase 2** — DONE. CUDA write path: `tbq-quants.cuh` device functions + custom
+  `k_set_rows_tbq` kernel. All SET_ROWS tests pass (GPU matches CPU bit-exact).
 - **Phase 3** — Pending. CUDA read path (flash attention).
 - **Phase 4** — Pending. Benchmarks.
 - **Phase 5** — Pending. Optimization.
@@ -63,17 +64,21 @@ g++ -std=c++17 -O2 -o test-tbq-math tests/test-tbq-math.cpp -lm && ./test-tbq-ma
 ### Upstream files we modify
 - `ggml/include/ggml.h` — type enum (add TBQ3_0, TBQ4_0)
 - `ggml/src/ggml-common.h` — block struct definitions
-- `ggml/src/ggml.c` — type_traits[] table
+- `ggml/src/ggml.c` — type_traits[] table + ggml_quantize_chunk
+- `ggml/src/ggml-quants.c` — CPU quantize/dequantize implementations
+- `ggml/src/ggml-quants.h` — CPU quantize/dequantize declarations
 - `ggml/src/ggml-cpu/ggml-cpu.c` — type_traits_cpu[] table
+- `ggml/src/ggml-cpu/quants.c` — CPU from_float + vec_dot wrappers
+- `ggml/src/ggml-cpu/quants.h` — CPU wrapper declarations
 - `ggml/src/ggml-cuda/set-rows.cu` — GPU quantize-on-write dispatch
-- `ggml/src/ggml-cuda/fattn-common.cuh` — flash attention K/V dequant
-- `ggml/src/ggml-cuda/fattn.cu` — type allowlist for FA kernels
-- `common/arg.cpp` — kv_cache_types vector (line 383)
+- `ggml/src/ggml-cuda/ggml-cuda.cu` — SET_ROWS type allowlist
+- `ggml/src/ggml-cuda/fattn-common.cuh` — flash attention K/V dequant (Phase 3)
+- `ggml/src/ggml-cuda/fattn.cu` — type allowlist for FA kernels (Phase 3)
+- `common/arg.cpp` — kv_cache_types vector
+- `tests/test-backend-ops.cpp` — TBQ SET_ROWS test cases
 
 ### New files we create
-- `ggml/src/ggml-cpu/tbq-quants.h` — CPU quantize/dequant declarations
-- `ggml/src/ggml-cpu/tbq-quants.cpp` — CPU kernels (FWHT, codebook, quantize, dequant)
-- `ggml/src/ggml-cuda/tbq-quants.cuh` — CUDA device functions
+- `ggml/src/ggml-cuda/tbq-quants.cuh` — CUDA TBQ device functions
 - `tests/test-tbq-math.cpp` — standalone algorithm tests (Phase 0, all passing)
 
 ### Reference files (read these to understand patterns)
