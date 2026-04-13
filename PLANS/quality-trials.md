@@ -54,10 +54,15 @@ GPU: RTX 3090 (sm_86)
 - Matches Trial 4 exactly — confirms QJL noise was the bottleneck in pre-conversion path
 - Fused VEC QJL (decode only) has negligible impact on PPL
 
-### Trial 7: Asymmetric K/V types (TBQ K + q4_0 V) — PENDING
+### Trial 7: Asymmetric K/V types (TBQ K + q4_0 V) — BLOCKED
 - Config: `--cache-type-k tbq4_0 --cache-type-v q4_0`
-- Status: Times out due to slow NC dequant kernel (single-threaded, even without QJL)
-- Expected: PPL ~5.5-6.0 (V quality dominates, q4_0 V is much better than TBQ V)
+- Status: Times out even at 30 min. NC dequant kernel launches 1 CUDA thread per TBQ block;
+  for 512 tokens × 8 heads × 32 layers = 131K sequential single-thread kernel launches.
+- **Estimated PPL: ~5.5-6.0** based on:
+  - V quality dominates PPL (Trial 4 proved removing QJL on V improved TBQ3 by 20%)
+  - q4_0 V alone gives PPL 5.53
+  - K quantization barely affects PPL (only affects attention score ranking, softmax-attenuated)
+- **Blocked on:** NC dequant kernel parallelization (Phase 5 optimization)
 
 ## Summary of Findings
 
@@ -69,3 +74,12 @@ GPU: RTX 3090 (sm_86)
    (4 or 8 levels) vs q4_0's adaptive uniform quantization (16 levels per block).
 5. **Asymmetric K/V** (TBQ K + q4_0 V) is the most promising path but blocked by slow
    NC dequant kernel performance.
+
+## Recommended Next Steps
+
+1. **Parallelize NC dequant kernel** — use 32+ threads per TBQ block instead of 1. This is
+   purely a CUDA optimization with no algorithm changes. Would unblock Trial 7 and make
+   all TBQ perplexity runs much faster.
+2. **Test asymmetric K/V** once NC kernel is fast — expected to give PPL ~5.5-6.0.
+3. **Value proposition:** TBQ K with fused VEC kernel (fast decode, no K dequant) + q4_0 V
+   (high quality output). Speed benefit from K, quality from V.
