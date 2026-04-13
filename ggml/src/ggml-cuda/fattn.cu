@@ -406,8 +406,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             if (mask && mask->ne[2] != 1) {
                 return BEST_FATTN_KERNEL_NONE;
             }
-            // VEC: fused TBQ dot product (no K dequant), best for decode
-            if (Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0 && Q->ne[1] <= 2) {
+            // VEC: fused TBQ dot product (no K dequant), best for decode.
+            // Only when V is also TBQ or f16 (VEC has no TBQ K + q4_0 V case).
+            if (Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0 && Q->ne[1] <= 2 &&
+                (V->type == K->type || V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_F32)) {
                 return BEST_FATTN_KERNEL_VEC;
             }
             // Prefill fallback: pre-convert K/V to fp16, use MMA/TILE
