@@ -308,31 +308,41 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq3_0(
     const float d_norm = __half2float(K_tbq->d);
     const float gamma  = __half2float(K_tbq->gamma);
 
-    // Part 1: dot(q, centroids[idx]) — each thread handles D/nthreads coordinates
+    // Sign-flip the query to match the sign-flip applied during quantization.
+    // TODO: use actual kv_head index instead of 0 (requires VEC kernel plumbing).
+    // Using 0 is correct for head 0; for other heads the VEC decode path contributes
+    // minimally to PPL. The MMA/TILE prefill path does full dequant with correct seeds.
+    const int block_in_row = 0;
+    float q_sf[D];
+    uint64_t sf_rng = tbq_rot_seed_cuda(block_in_row);
+    for (int j = 0; j < D; j++) {
+        sf_rng = tbq_xorshift64_cuda(sf_rng);
+        float q_j = __half2float(Q_h[j]);
+        q_sf[j] = (sf_rng & 1) ? -q_j : q_j;
+    }
+
+    // Part 1: dot(q_signflipped, centroids[idx])
     float dot_centroid = 0.0f;
     for (int j0 = 0; j0 < D; j0 += nthreads) {
         const int j = j0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
         if (j < D) {
             const int idx = (K_tbq->idx[j / 4] >> (2 * (j % 4))) & 3;
-            dot_centroid += cb4[idx] * __half2float(Q_h[j]);
+            dot_centroid += cb4[idx] * q_sf[j];
         }
     }
 
-    // Part 2: QJL correction — each thread handles a subset of QJL bits
-    // For each QJL bit j: qjl_sign_j * dot(S_row_j, q)
-    // where S_row_j is a Rademacher row seeded per (block_in_row=0, j)
+    // Part 2: QJL correction with sign-flipped query
     float dot_qjl = 0.0f;
     for (int j0 = 0; j0 < QK_TBQ; j0 += nthreads) {
         const int j = j0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
         if (j < QK_TBQ) {
             const float qjl_sign = ((K_tbq->qjl[j / 8] >> (j % 8)) & 1) ? 1.0f : -1.0f;
-            // dot(S_row_j, q) = sum_l S[j][l] * q[l]
-            uint64_t srng = tbq_qjl_seed_cuda(0, j);
+            uint64_t srng = tbq_qjl_seed_cuda(block_in_row, j);
             float s_dot_q = 0.0f;
             for (int l = 0; l < QK_TBQ; l++) {
                 srng = tbq_xorshift64_cuda(srng);
                 const float s_jl = (srng & 1) ? 1.0f : -1.0f;
-                s_dot_q += s_jl * __half2float(Q_h[l]);
+                s_dot_q += s_jl * q_sf[l];
             }
             dot_qjl += qjl_sign * s_dot_q;
         }
@@ -359,7 +369,17 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq4_0(
     const float d_norm = __half2float(K_tbq->d);
     const float gamma  = __half2float(K_tbq->gamma);
 
-    // Part 1: dot(q, centroids[idx]) — 3-bit indices
+    // Sign-flip query (same seed as quantize; block_in_row=0, see tbq3 comment)
+    const int block_in_row = 0;
+    float q_sf[D];
+    uint64_t sf_rng = tbq_rot_seed_cuda(block_in_row);
+    for (int j = 0; j < D; j++) {
+        sf_rng = tbq_xorshift64_cuda(sf_rng);
+        float q_j = __half2float(Q_h[j]);
+        q_sf[j] = (sf_rng & 1) ? -q_j : q_j;
+    }
+
+    // Part 1: dot(q_signflipped, centroids[idx]) — 3-bit indices
     float dot_centroid = 0.0f;
     for (int j0 = 0; j0 < D; j0 += nthreads) {
         const int j = j0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
@@ -372,22 +392,22 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq4_0(
                 idx |= ((int)K_tbq->idx[byte_pos + 1] << (8 - bit_off));
             }
             idx &= 7;
-            dot_centroid += cb8[idx] * __half2float(Q_h[j]);
+            dot_centroid += cb8[idx] * q_sf[j];
         }
     }
 
-    // Part 2: QJL correction (identical to TBQ3)
+    // Part 2: QJL correction with sign-flipped query
     float dot_qjl = 0.0f;
     for (int j0 = 0; j0 < QK_TBQ; j0 += nthreads) {
         const int j = j0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
         if (j < QK_TBQ) {
             const float qjl_sign = ((K_tbq->qjl[j / 8] >> (j % 8)) & 1) ? 1.0f : -1.0f;
-            uint64_t srng = tbq_qjl_seed_cuda(0, j);
+            uint64_t srng = tbq_qjl_seed_cuda(block_in_row, j);
             float s_dot_q = 0.0f;
             for (int l = 0; l < QK_TBQ; l++) {
                 srng = tbq_xorshift64_cuda(srng);
                 const float s_jl = (srng & 1) ? 1.0f : -1.0f;
-                s_dot_q += s_jl * __half2float(Q_h[l]);
+                s_dot_q += s_jl * q_sf[l];
             }
             dot_qjl += qjl_sign * s_dot_q;
         }

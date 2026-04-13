@@ -102,6 +102,9 @@ static __global__ void flash_attn_ext_vec(
     K += nb13*sequence + nb12*(head / gqa_ratio);
     V += nb23*sequence + nb22*(head / gqa_ratio);
 
+    // Note: TBQ fused dot product uses block_in_row=0 for sign-flip PRNG seeding.
+    // TODO: pass (head / gqa_ratio) to the dot function for correct per-head seeding.
+
     const half * maskh  = (const half  *) (mask + nb33*(sequence % ne33) + nb31*ic0);
 
     const float slope = get_alibi_slope(max_bias, head, n_head_log2, m0, m1);

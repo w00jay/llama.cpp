@@ -60,10 +60,15 @@ static __device__ void quantize_f32_tbq3_0_block(const float * __restrict__ x,
     norm = sqrtf(norm);
     y->d = __float2half(norm);
 
-    // Step 2: normalize (external Hadamard rotation is applied by llama.cpp before set_rows)
+    // Step 2: normalize + random sign-flip (completes SRHT with external WHT)
     float inv_norm = (norm > 1e-10f) ? 1.0f / norm : 0.0f;
     for (int j = 0; j < QK_TBQ; j++) {
         tmp[j] = x[j] * inv_norm;
+    }
+    uint64_t rng = tbq_rot_seed_cuda(block_idx);
+    for (int j = 0; j < QK_TBQ; j++) {
+        rng = tbq_xorshift64_cuda(rng);
+        if (rng & 1) tmp[j] = -tmp[j];
     }
 
     // Step 3: nearest centroid (2-bit = 4 centroids)
@@ -128,10 +133,15 @@ static __device__ void quantize_f32_tbq4_0_block(const float * __restrict__ x,
     norm = sqrtf(norm);
     y->d = __float2half(norm);
 
-    // Step 2: normalize (external Hadamard rotation is applied by llama.cpp before set_rows)
+    // Step 2: normalize + random sign-flip (completes SRHT with external WHT)
     float inv_norm = (norm > 1e-10f) ? 1.0f / norm : 0.0f;
     for (int j = 0; j < QK_TBQ; j++) {
         tmp[j] = x[j] * inv_norm;
+    }
+    uint64_t rng = tbq_rot_seed_cuda(block_idx);
+    for (int j = 0; j < QK_TBQ; j++) {
+        rng = tbq_xorshift64_cuda(rng);
+        if (rng & 1) tmp[j] = -tmp[j];
     }
 
     // Step 3: nearest centroid (3-bit = 8 centroids)
@@ -219,7 +229,14 @@ static __device__ void dequantize_f32_tbq3_0_block(const block_tbq3_0 * __restri
         tmp[j] += qjl_scale * acc[j];
     }
 
-    // Step 3: scale by vector norm (no inverse rotation — external rotation is never inverted)
+    // Step 3: undo sign-flip (D² = I)
+    uint64_t rng = tbq_rot_seed_cuda(block_idx);
+    for (int j = 0; j < QK_TBQ; j++) {
+        rng = tbq_xorshift64_cuda(rng);
+        if (rng & 1) tmp[j] = -tmp[j];
+    }
+
+    // Step 4: scale by vector norm
     for (int j = 0; j < QK_TBQ; j++) {
         y[j] = d_norm * tmp[j];
     }
@@ -269,7 +286,14 @@ static __device__ void dequantize_f32_tbq4_0_block(const block_tbq4_0 * __restri
         tmp[j] += qjl_scale * acc[j];
     }
 
-    // Step 3: scale by vector norm (no inverse rotation — external rotation is never inverted)
+    // Step 3: undo sign-flip (D² = I)
+    uint64_t rng = tbq_rot_seed_cuda(block_idx);
+    for (int j = 0; j < QK_TBQ; j++) {
+        rng = tbq_xorshift64_cuda(rng);
+        if (rng & 1) tmp[j] = -tmp[j];
+    }
+
+    // Step 4: scale by vector norm
     for (int j = 0; j < QK_TBQ; j++) {
         y[j] = d_norm * tmp[j];
     }
