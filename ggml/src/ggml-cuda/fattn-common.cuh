@@ -307,6 +307,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq3_0(
     constexpr float cb4[4] = { -1.335033e-01f, -4.002048e-02f, 4.002048e-02f, 1.335033e-01f };
     const float d_norm = __half2float(K_tbq->d);
     const float gamma  = __half2float(K_tbq->gamma);
+    const float block_scale = __half2float(K_tbq->s);
 
     // Sign-flip the query to match the sign-flip applied during quantization.
     // TODO: use actual kv_head index instead of 0 (requires VEC kernel plumbing).
@@ -327,7 +328,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq3_0(
         const int j = j0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
         if (j < D) {
             const int idx = (K_tbq->idx[j / 4] >> (2 * (j % 4))) & 3;
-            dot_centroid += cb4[idx] * q_sf[j];
+            dot_centroid += block_scale * cb4[idx] * q_sf[j];
         }
     }
 
@@ -348,7 +349,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq3_0(
         }
     }
 
-    const float qjl_scale = sqrtf((float)M_PI / 2.0f) / (float)QK_TBQ * gamma;
+    const float qjl_scale = block_scale * sqrtf((float)M_PI / 2.0f) / (float)QK_TBQ * gamma;
     return d_norm * (dot_centroid + qjl_scale * dot_qjl);
 }
 
@@ -368,6 +369,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq4_0(
     };
     const float d_norm = __half2float(K_tbq->d);
     const float gamma  = __half2float(K_tbq->gamma);
+    const float block_scale = __half2float(K_tbq->s);
 
     // Sign-flip query (same seed as quantize; block_in_row=0, see tbq3 comment)
     const int block_in_row = 0;
@@ -392,7 +394,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq4_0(
                 idx |= ((int)K_tbq->idx[byte_pos + 1] << (8 - bit_off));
             }
             idx &= 7;
-            dot_centroid += cb8[idx] * q_sf[j];
+            dot_centroid += block_scale * cb8[idx] * q_sf[j];
         }
     }
 
@@ -413,7 +415,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq4_0(
         }
     }
 
-    const float qjl_scale = sqrtf((float)M_PI / 2.0f) / (float)QK_TBQ * gamma;
+    const float qjl_scale = block_scale * sqrtf((float)M_PI / 2.0f) / (float)QK_TBQ * gamma;
     return d_norm * (dot_centroid + qjl_scale * dot_qjl);
 }
 

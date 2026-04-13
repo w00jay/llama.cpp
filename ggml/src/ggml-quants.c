@@ -2481,6 +2481,22 @@ void quantize_row_tbq3_0_ref(const float * GGML_RESTRICT x, block_tbq3_0 * GGML_
             if (tbq_xorshift64(&rng) & 1) tmp[j] = -tmp[j];
         }
 
+        // Step 2b: per-block adaptive scale
+        // Codebook assumes coords ~ N(0, 1/d) with std = 1/sqrt(d).
+        // Compute actual RMS and scale coords so they match codebook distribution.
+        float sum_sq = 0.0f;
+        for (int j = 0; j < QK_TBQ; j++) {
+            sum_sq += tmp[j] * tmp[j];
+        }
+        float actual_rms = sqrtf(sum_sq / (float)QK_TBQ);
+        float expected_rms = 1.0f / sqrtf((float)QK_TBQ);  // sqrt(1/d) for unit vector
+        float block_scale = (actual_rms > 1e-10f) ? actual_rms / expected_rms : 1.0f;
+        float inv_scale = 1.0f / block_scale;
+        y[i].s = GGML_FP32_TO_FP16(block_scale);
+        for (int j = 0; j < QK_TBQ; j++) {
+            tmp[j] *= inv_scale;
+        }
+
         // Step 3: nearest centroid (2-bit = 4 centroids)
         memset(y[i].idx, 0, sizeof(y[i].idx));
         float centroid_vals[QK_TBQ];
@@ -2496,7 +2512,7 @@ void quantize_row_tbq3_0_ref(const float * GGML_RESTRICT x, block_tbq3_0 * GGML_
             centroid_vals[j] = tbq_codebook_4[best];
         }
 
-        // Step 4: residual
+        // Step 4: residual (in scaled domain)
         float residual[QK_TBQ];
         float gamma_sq = 0.0f;
         for (int j = 0; j < QK_TBQ; j++) {
@@ -2549,6 +2565,20 @@ void quantize_row_tbq4_0_ref(const float * GGML_RESTRICT x, block_tbq4_0 * GGML_
             if (tbq_xorshift64(&rng) & 1) tmp[j] = -tmp[j];
         }
 
+        // Step 2b: per-block adaptive scale
+        float sum_sq = 0.0f;
+        for (int j = 0; j < QK_TBQ; j++) {
+            sum_sq += tmp[j] * tmp[j];
+        }
+        float actual_rms = sqrtf(sum_sq / (float)QK_TBQ);
+        float expected_rms = 1.0f / sqrtf((float)QK_TBQ);
+        float block_scale = (actual_rms > 1e-10f) ? actual_rms / expected_rms : 1.0f;
+        float inv_scale = 1.0f / block_scale;
+        y[i].s = GGML_FP32_TO_FP16(block_scale);
+        for (int j = 0; j < QK_TBQ; j++) {
+            tmp[j] *= inv_scale;
+        }
+
         // Step 3: nearest centroid (3-bit = 8 centroids)
         memset(y[i].idx, 0, sizeof(y[i].idx));
         float centroid_vals[QK_TBQ];
@@ -2570,7 +2600,7 @@ void quantize_row_tbq4_0_ref(const float * GGML_RESTRICT x, block_tbq4_0 * GGML_
             centroid_vals[j] = tbq_codebook_8[best];
         }
 
-        // Step 4: residual
+        // Step 4: residual (in scaled domain)
         float residual[QK_TBQ];
         float gamma_sq = 0.0f;
         for (int j = 0; j < QK_TBQ; j++) {
@@ -2602,16 +2632,17 @@ void dequantize_row_tbq3_0(const block_tbq3_0 * GGML_RESTRICT x, float * GGML_RE
     for (int64_t i = 0; i < nb; i++) {
         const float d_norm = GGML_FP16_TO_FP32(x[i].d);
         const float gamma  = GGML_FP16_TO_FP32(x[i].gamma);
+        const float block_scale = GGML_FP16_TO_FP32(x[i].s);
         float tmp[QK_TBQ];
 
-        // Step 1: reconstruct from 2-bit centroid indices
+        // Step 1: reconstruct from 2-bit centroid indices, scaled by per-block scale
         for (int j = 0; j < QK_TBQ; j++) {
             int idx = (x[i].idx[j / 4] >> (2 * (j % 4))) & 3;
-            tmp[j] = tbq_codebook_4[idx];
+            tmp[j] = block_scale * tbq_codebook_4[idx];
         }
 
-        // Step 2: add QJL reconstruction
-        float qjl_scale = sqrtf((float)M_PI / 2.0f) / (float)QK_TBQ * gamma;
+        // Step 2: add QJL reconstruction (also scaled)
+        float qjl_scale = block_scale * sqrtf((float)M_PI / 2.0f) / (float)QK_TBQ * gamma;
         for (int j = 0; j < QK_TBQ; j++) {
             // Compute (S^T * qjl_signs)[j] = sum_l S[l][j] * sign[l]
             float acc = 0.0f;
@@ -2652,9 +2683,10 @@ void dequantize_row_tbq4_0(const block_tbq4_0 * GGML_RESTRICT x, float * GGML_RE
     for (int64_t i = 0; i < nb; i++) {
         const float d_norm = GGML_FP16_TO_FP32(x[i].d);
         const float gamma  = GGML_FP16_TO_FP32(x[i].gamma);
+        const float block_scale = GGML_FP16_TO_FP32(x[i].s);
         float tmp[QK_TBQ];
 
-        // Step 1: reconstruct from 3-bit centroid indices
+        // Step 1: reconstruct from 3-bit centroid indices, scaled
         for (int j = 0; j < QK_TBQ; j++) {
             int bit_pos = j * 3;
             int byte_pos = bit_pos / 8;
@@ -2664,11 +2696,11 @@ void dequantize_row_tbq4_0(const block_tbq4_0 * GGML_RESTRICT x, float * GGML_RE
                 idx |= (x[i].idx[byte_pos + 1] << (8 - bit_off));
             }
             idx &= 7;
-            tmp[j] = tbq_codebook_8[idx];
+            tmp[j] = block_scale * tbq_codebook_8[idx];
         }
 
-        // Step 2: add QJL reconstruction
-        float qjl_scale = sqrtf((float)M_PI / 2.0f) / (float)QK_TBQ * gamma;
+        // Step 2: add QJL reconstruction (scaled)
+        float qjl_scale = block_scale * sqrtf((float)M_PI / 2.0f) / (float)QK_TBQ * gamma;
         for (int j = 0; j < QK_TBQ; j++) {
             float acc = 0.0f;
             for (int l = 0; l < QK_TBQ; l++) {

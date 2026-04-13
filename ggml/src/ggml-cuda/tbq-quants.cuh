@@ -71,6 +71,20 @@ static __device__ void quantize_f32_tbq3_0_block(const float * __restrict__ x,
         if (rng & 1) tmp[j] = -tmp[j];
     }
 
+    // Step 2b: per-block adaptive scale
+    float sum_sq = 0.0f;
+    for (int j = 0; j < QK_TBQ; j++) {
+        sum_sq += tmp[j] * tmp[j];
+    }
+    float actual_rms = sqrtf(sum_sq / (float)QK_TBQ);
+    float expected_rms = 1.0f / sqrtf((float)QK_TBQ);
+    float block_scale = (actual_rms > 1e-10f) ? actual_rms / expected_rms : 1.0f;
+    float inv_scale = 1.0f / block_scale;
+    y->s = __float2half(block_scale);
+    for (int j = 0; j < QK_TBQ; j++) {
+        tmp[j] *= inv_scale;
+    }
+
     // Step 3: nearest centroid (2-bit = 4 centroids)
     for (int j = 0; j < QK_TBQ / 4; j++) { y->idx[j] = 0; }
 
@@ -86,7 +100,7 @@ static __device__ void quantize_f32_tbq3_0_block(const float * __restrict__ x,
         centroid_vals[j] = cb[best];
     }
 
-    // Step 4: residual
+    // Step 4: residual (in scaled domain)
     float residual[QK_TBQ];
     float gamma_sq = 0.0f;
     for (int j = 0; j < QK_TBQ; j++) {
@@ -142,6 +156,20 @@ static __device__ void quantize_f32_tbq4_0_block(const float * __restrict__ x,
     for (int j = 0; j < QK_TBQ; j++) {
         rng = tbq_xorshift64_cuda(rng);
         if (rng & 1) tmp[j] = -tmp[j];
+    }
+
+    // Step 2b: per-block adaptive scale
+    float sum_sq = 0.0f;
+    for (int j = 0; j < QK_TBQ; j++) {
+        sum_sq += tmp[j] * tmp[j];
+    }
+    float actual_rms = sqrtf(sum_sq / (float)QK_TBQ);
+    float expected_rms = 1.0f / sqrtf((float)QK_TBQ);
+    float block_scale = (actual_rms > 1e-10f) ? actual_rms / expected_rms : 1.0f;
+    float inv_scale = 1.0f / block_scale;
+    y->s = __float2half(block_scale);
+    for (int j = 0; j < QK_TBQ; j++) {
+        tmp[j] *= inv_scale;
     }
 
     // Step 3: nearest centroid (3-bit = 8 centroids)
@@ -201,16 +229,17 @@ static __device__ void dequantize_f32_tbq3_0_block(const block_tbq3_0 * __restri
     const float cb[4] = { -1.335033e-01f, -4.002048e-02f, 4.002048e-02f, 1.335033e-01f };
     const float d_norm = __half2float(x->d);
     const float gamma  = __half2float(x->gamma);
+    const float block_scale = __half2float(x->s);
 
     float tmp[QK_TBQ];
 
-    // Step 1: reconstruct from 2-bit centroid indices
+    // Step 1: reconstruct from 2-bit centroid indices, scaled
     for (int j = 0; j < QK_TBQ; j++) {
         int idx = (x->idx[j / 4] >> (2 * (j % 4))) & 3;
-        tmp[j] = cb[idx];
+        tmp[j] = block_scale * cb[idx];
     }
 
-    // Step 2: QJL reconstruction — compute S^T * qjl_signs column-wise (O(d^2))
+    // Step 2: QJL reconstruction (scaled) — compute S^T * qjl_signs column-wise (O(d^2))
     float acc[QK_TBQ];
     for (int j = 0; j < QK_TBQ; j++) acc[j] = 0.0f;
 
@@ -224,7 +253,7 @@ static __device__ void dequantize_f32_tbq3_0_block(const block_tbq3_0 * __restri
         }
     }
 
-    const float qjl_scale = sqrtf((float)M_PI / 2.0f) / (float)QK_TBQ * gamma;
+    const float qjl_scale = block_scale * sqrtf((float)M_PI / 2.0f) / (float)QK_TBQ * gamma;
     for (int j = 0; j < QK_TBQ; j++) {
         tmp[j] += qjl_scale * acc[j];
     }
@@ -251,10 +280,11 @@ static __device__ void dequantize_f32_tbq4_0_block(const block_tbq4_0 * __restri
     };
     const float d_norm = __half2float(x->d);
     const float gamma  = __half2float(x->gamma);
+    const float block_scale = __half2float(x->s);
 
     float tmp[QK_TBQ];
 
-    // Step 1: reconstruct from 3-bit centroid indices
+    // Step 1: reconstruct from 3-bit centroid indices, scaled
     for (int j = 0; j < QK_TBQ; j++) {
         int bit_pos  = j * 3;
         int byte_pos = bit_pos / 8;
@@ -264,10 +294,10 @@ static __device__ void dequantize_f32_tbq4_0_block(const block_tbq4_0 * __restri
             idx |= ((int)x->idx[byte_pos + 1] << (8 - bit_off));
         }
         idx &= 7;
-        tmp[j] = cb[idx];
+        tmp[j] = block_scale * cb[idx];
     }
 
-    // Step 2: QJL reconstruction — compute S^T * qjl_signs column-wise (O(d^2))
+    // Step 2: QJL reconstruction (scaled) — compute S^T * qjl_signs column-wise (O(d^2))
     float acc[QK_TBQ];
     for (int j = 0; j < QK_TBQ; j++) acc[j] = 0.0f;
 
@@ -281,7 +311,7 @@ static __device__ void dequantize_f32_tbq4_0_block(const block_tbq4_0 * __restri
         }
     }
 
-    const float qjl_scale = sqrtf((float)M_PI / 2.0f) / (float)QK_TBQ * gamma;
+    const float qjl_scale = block_scale * sqrtf((float)M_PI / 2.0f) / (float)QK_TBQ * gamma;
     for (int j = 0; j < QK_TBQ; j++) {
         tmp[j] += qjl_scale * acc[j];
     }

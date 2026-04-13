@@ -187,19 +187,21 @@ static_assert(sizeof(block_q1_0) == sizeof(ggml_half) + QK1_0 / 8, "wrong q1_0 b
 typedef struct {
     ggml_half d;              // vector norm ||x||
     ggml_half gamma;          // residual norm ||r||
+    ggml_half s;              // per-block scale: actual_std / codebook_std
     uint8_t   idx[QK_TBQ/4]; // 2-bit centroid indices, packed 4 per byte (32 bytes)
     uint8_t   qjl[QK_TBQ/8]; // 1-bit QJL signs, packed 8 per byte (16 bytes)
 } block_tbq3_0;
-static_assert(sizeof(block_tbq3_0) == 2 * sizeof(ggml_half) + QK_TBQ/4 + QK_TBQ/8, "wrong tbq3_0 block size/padding");
+static_assert(sizeof(block_tbq3_0) == 3 * sizeof(ggml_half) + QK_TBQ/4 + QK_TBQ/8, "wrong tbq3_0 block size/padding");
 
 // TBQ4_0: 4 bits/coord = 3-bit Lloyd-Max index + 1-bit QJL sign
 typedef struct {
     ggml_half d;                // vector norm ||x||
     ggml_half gamma;            // residual norm ||r||
+    ggml_half s;                // per-block scale: actual_std / codebook_std
     uint8_t   idx[3*QK_TBQ/8]; // 3-bit centroid indices, packed (48 bytes)
     uint8_t   qjl[QK_TBQ/8];   // 1-bit QJL signs, packed 8 per byte (16 bytes)
 } block_tbq4_0;
-static_assert(sizeof(block_tbq4_0) == 2 * sizeof(ggml_half) + 3*QK_TBQ/8 + QK_TBQ/8, "wrong tbq4_0 block size/padding");
+static_assert(sizeof(block_tbq4_0) == 3 * sizeof(ggml_half) + 3*QK_TBQ/8 + QK_TBQ/8, "wrong tbq4_0 block size/padding");
 
 #define QK4_0 32
 typedef struct {
