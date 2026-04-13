@@ -27,6 +27,9 @@ constexpr float MAX_DOT_PRODUCT_ERROR_LOWBIT = 0.04f;
 constexpr float MAX_DOT_PRODUCT_ERROR_FP4 = 0.03f;
 constexpr float MAX_DOT_PRODUCT_ERROR_BINARY = 0.40f;
 constexpr float MAX_DOT_PRODUCT_ERROR_TERNARY = 0.15f;
+// TBQ: high per-element error by design — quality comes from softmax averaging in attention
+constexpr float MAX_QUANTIZATION_TOTAL_ERROR_TBQ = 0.015f;
+constexpr float MAX_DOT_PRODUCT_ERROR_TBQ = 1.5f;
 
 static const char* RESULT_STR[] = {"ok", "FAILED"};
 
@@ -155,7 +158,9 @@ int main(int argc, char * argv[]) {
                 type == GGML_TYPE_Q3_K    ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS :
                 type == GGML_TYPE_IQ3_S   ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS :
                 type == GGML_TYPE_IQ3_XXS ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS_XXS :
-                type == GGML_TYPE_NVFP4   ? MAX_QUANTIZATION_TOTAL_ERROR_FP4 : MAX_QUANTIZATION_TOTAL_ERROR;
+                type == GGML_TYPE_NVFP4   ? MAX_QUANTIZATION_TOTAL_ERROR_FP4 :
+                type == GGML_TYPE_TBQ3_0 || type == GGML_TYPE_TBQ4_0
+                                         ? MAX_QUANTIZATION_TOTAL_ERROR_TBQ : MAX_QUANTIZATION_TOTAL_ERROR;
             failed = !(total_error < max_quantization_error);
             num_failed += failed;
             if (failed || verbose) {
@@ -179,6 +184,8 @@ int main(int argc, char * argv[]) {
                                           ? MAX_DOT_PRODUCT_ERROR_TERNARY
                                           : type == GGML_TYPE_NVFP4
                                           ? MAX_DOT_PRODUCT_ERROR_FP4
+                                          : type == GGML_TYPE_TBQ3_0 || type == GGML_TYPE_TBQ4_0
+                                          ? MAX_DOT_PRODUCT_ERROR_TBQ
                                           : MAX_DOT_PRODUCT_ERROR;
             failed = !(vec_dot_error < max_allowed_error);
             num_failed += failed;

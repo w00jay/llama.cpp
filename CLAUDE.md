@@ -68,8 +68,9 @@ g++ -std=c++17 -O2 -o test-tbq-math tests/test-tbq-math.cpp -lm && ./test-tbq-ma
 - **Phase 2** — DONE. CUDA write path: `tbq-quants.cuh` device functions + custom
   `k_set_rows_tbq` kernel. All SET_ROWS tests pass (GPU matches CPU bit-exact).
 - **Phase 3** — DONE. CUDA read path (flash attention). TBQ K/V dequantized to fp16 via
-  `dequantize_row_tbq3_0/4_0_cuda`, routed to MMA/TILE kernels in fattn.cu. Build clean,
-  0 test failures. Files: tbq-quants.cuh, convert.cu, fattn.cu, test-backend-ops.cpp.
+  contiguous and non-contiguous (NC) dequant kernels in convert.cu, routed to MMA/TILE
+  kernels via the general FA path in fattn.cu. 4/4 TBQ FLASH_ATTN_EXT tests pass on GPU,
+  2838 total FA tests OK, 0 FAIL. Files: tbq-quants.cuh, convert.cu, fattn.cu.
 - **Phase 4** — Pending. Benchmarks.
 - **Phase 5** — Pending. Optimization.
 

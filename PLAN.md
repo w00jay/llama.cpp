@@ -352,19 +352,23 @@ pre-converts to FP16 via the dequantize path (fattn-common.cuh:965-1010).
 This works automatically if `to_float` is implemented. Initial implementation
 can rely on this fallback; fused kernels are an optimization for later.
 
-**Phase 3 Results (completed 2026-04-12):**
+**Phase 3 Results (completed 2026-04-12, NC fix 2026-04-12):**
 - Dequantize device functions added to `tbq-quants.cuh`:
   `dequantize_f32_tbq3_0_block` and `dequantize_f32_tbq4_0_block`
 - QJL reconstruction uses O(d^2) column-wise loop (vs O(d^3) naive loop in CPU code)
-- CUDA kernels `k_dequantize_row_tbq3_0` / `k_dequantize_row_tbq4_0` added to `convert.cu`
-  — one thread per TBQ block, `block_in_row = flat_idx % blocks_per_row` (= 0 for head_dim=128)
-- Registered in `ggml_get_to_fp16_cuda` (TBQ3_0 → fp16, TBQ4_0 → fp16)
-- TBQ3_0 and TBQ4_0 added to type allowlist in `ggml_cuda_get_best_fattn_kernel` (fattn.cu)
-- Routed to MMA_F16 (Ampere/Turing) or TILE (older GPU), never VEC (which has no TBQ dispatch)
-- Guards: mask->ne[2]!=1 check, non-contiguous K/V check (nc dequant not yet implemented)
-- TBQ flash attention test cases added to test-backend-ops.cpp (decoding + prefill shapes)
-- Build clean, 0 FAIL on test-backend-ops FLASH_ATTN_EXT (CUDA backend skipped in env without GPU)
-- Files: tbq-quants.cuh, convert.cu, fattn.cu, test-backend-ops.cpp (+210 lines)
+- CUDA kernels: contiguous (`k_dequantize_row_tbq3_0/4_0`) and non-contiguous
+  (`k_dequantize_nc_tbq3_0/4_0`) variants in `convert.cu`
+- Registered in both `ggml_get_to_fp16_cuda` and `ggml_get_to_fp16_nc_cuda`
+- TBQ falls through to general FA kernel selection in fattn.cu (handles mask, GQA, MMA/TILE)
+- TBQ flash attention test cases in test-backend-ops.cpp (decoding + prefill shapes)
+- 4/4 TBQ FLASH_ATTN_EXT tests pass on GPU (RTX 3090), 2838 total OK, 0 FAIL
+- TBQ-specific error thresholds added to test-quantize-fns.cpp
+- Files: tbq-quants.cuh, convert.cu, fattn.cu, test-backend-ops.cpp, test-quantize-fns.cpp
+
+**NC dequant fix:** The initial Phase 3 implementation only handled contiguously allocated
+K/V tensors, but KV cache tensors in llama.cpp are always views (non-contiguous). The fix
+added stride-aware NC dequant kernels that index source blocks via `(i03*s03 + i02*s02 +
+i01*s01)` strides, matching the pattern used by Q4_0/Q8_0 in `dequantize_block_cuda`.
 
 **Implementation note:** Phase 3 uses the fallback fp16 pre-conversion path. The TILE and MMA
 kernels receive K/V already converted to fp16 and operate on that. The TBQ dequant is done

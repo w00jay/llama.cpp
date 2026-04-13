@@ -754,6 +754,95 @@ static void dequantize_row_tbq4_0_cuda(const void * vx, dst_t * y, const int64_t
     k_dequantize_row_tbq4_0<<<nb, 1, 0, stream>>>(vx, y, blocks_per_row);
 }
 
+// --- TBQ non-contiguous dequantize kernels (for KV cache views) ---
+//
+// KV cache K/V tensors are always views of a larger cache allocation, so strides
+// between dim-1/2/3 slices may include gaps.  These kernels use the same per-block
+// dequantize functions as the contiguous path but read source blocks via strides.
+// Strides s01/s02/s03 are in units of TBQ blocks (= type_size bytes each).
+
+template<typename dst_t>
+static __global__ void k_dequantize_nc_tbq3_0(const void * __restrict__ vx,
+                                                dst_t * __restrict__ y,
+                                                const int64_t ne01,
+                                                const int64_t ne0203, const uint3 ne02_fdv,
+                                                const int64_t s01, const int64_t s02, const int64_t s03) {
+    const block_tbq3_0 * src = (const block_tbq3_0 *)vx;
+
+    for (int64_t i01 = blockIdx.y; i01 < ne01; i01 += gridDim.y) {
+        for (int64_t i0203 = blockIdx.z; i0203 < ne0203; i0203 += gridDim.z) {
+            const uint2 dm = fast_div_modulo((uint32_t)i0203, ne02_fdv);
+            const int64_t i02 = dm.y;
+            const int64_t i03 = dm.x;
+
+            const int64_t src_idx = i03*s03 + i02*s02 + i01*s01;
+            const int64_t block_in_row = 0;  // ne00 == QK_TBQ, always 1 block per row
+
+            float tmp[QK_TBQ];
+            dequantize_f32_tbq3_0_block(&src[src_idx], tmp, block_in_row);
+
+            dst_t * y_block = y + (i0203*ne01 + i01) * QK_TBQ;
+            for (int j = 0; j < QK_TBQ; j++) {
+                y_block[j] = (dst_t)tmp[j];
+            }
+        }
+    }
+}
+
+template<typename dst_t>
+static __global__ void k_dequantize_nc_tbq4_0(const void * __restrict__ vx,
+                                                dst_t * __restrict__ y,
+                                                const int64_t ne01,
+                                                const int64_t ne0203, const uint3 ne02_fdv,
+                                                const int64_t s01, const int64_t s02, const int64_t s03) {
+    const block_tbq4_0 * src = (const block_tbq4_0 *)vx;
+
+    for (int64_t i01 = blockIdx.y; i01 < ne01; i01 += gridDim.y) {
+        for (int64_t i0203 = blockIdx.z; i0203 < ne0203; i0203 += gridDim.z) {
+            const uint2 dm = fast_div_modulo((uint32_t)i0203, ne02_fdv);
+            const int64_t i02 = dm.y;
+            const int64_t i03 = dm.x;
+
+            const int64_t src_idx = i03*s03 + i02*s02 + i01*s01;
+            const int64_t block_in_row = 0;
+
+            float tmp[QK_TBQ];
+            dequantize_f32_tbq4_0_block(&src[src_idx], tmp, block_in_row);
+
+            dst_t * y_block = y + (i0203*ne01 + i01) * QK_TBQ;
+            for (int j = 0; j < QK_TBQ; j++) {
+                y_block[j] = (dst_t)tmp[j];
+            }
+        }
+    }
+}
+
+template<typename dst_t>
+static void dequantize_nc_tbq3_0_cuda(const void * vx, dst_t * y,
+        int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
+        int64_t s01, int64_t s02, int64_t s03, cudaStream_t stream) {
+    GGML_ASSERT(ne00 == QK_TBQ);
+    const int64_t ne0203 = ne02 * ne03;
+    const uint3 ne02_fdv = init_fastdiv_values(ne02);
+    const dim3 num_blocks(1, (int)std::min(ne01, (int64_t)65535),
+                             (int)std::min(ne0203, (int64_t)65535));
+    k_dequantize_nc_tbq3_0<<<num_blocks, 1, 0, stream>>>(
+        vx, y, ne01, ne0203, ne02_fdv, s01, s02, s03);
+}
+
+template<typename dst_t>
+static void dequantize_nc_tbq4_0_cuda(const void * vx, dst_t * y,
+        int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
+        int64_t s01, int64_t s02, int64_t s03, cudaStream_t stream) {
+    GGML_ASSERT(ne00 == QK_TBQ);
+    const int64_t ne0203 = ne02 * ne03;
+    const uint3 ne02_fdv = init_fastdiv_values(ne02);
+    const dim3 num_blocks(1, (int)std::min(ne01, (int64_t)65535),
+                             (int)std::min(ne0203, (int64_t)65535));
+    k_dequantize_nc_tbq4_0<<<num_blocks, 1, 0, stream>>>(
+        vx, y, ne01, ne0203, ne02_fdv, s01, s02, s03);
+}
+
 to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
     switch (type) {
         case GGML_TYPE_F32:
@@ -894,6 +983,10 @@ to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type) {
             return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;
         case GGML_TYPE_BF16:
             return convert_unary_cuda<nv_bfloat16>;
+        case GGML_TYPE_TBQ3_0:
+            return dequantize_nc_tbq3_0_cuda;
+        case GGML_TYPE_TBQ4_0:
+            return dequantize_nc_tbq4_0_cuda;
         default:
             return nullptr;
     }
