@@ -760,6 +760,10 @@ static void dequantize_row_tbq4_0_cuda(const void * vx, dst_t * y, const int64_t
 // between dim-1/2/3 slices may include gaps.  These kernels use the same per-block
 // dequantize functions as the contiguous path but read source blocks via strides.
 // Strides s01/s02/s03 are in units of TBQ blocks (= type_size bytes each).
+//
+// PRNG seeding: TBQ quantize (set_rows) seeds with block_idx = position within
+// the cache row (0..n_head_kv-1).  FA reads the cache as [head_dim, kv_size, n_heads]
+// with s01 = n_head_kv blocks.  The within-row block position = src_idx % s01.
 
 template<typename dst_t>
 static __global__ void k_dequantize_nc_tbq3_0(const void * __restrict__ vx,
@@ -776,7 +780,8 @@ static __global__ void k_dequantize_nc_tbq3_0(const void * __restrict__ vx,
             const int64_t i03 = dm.x;
 
             const int64_t src_idx = i03*s03 + i02*s02 + i01*s01;
-            const int64_t block_in_row = 0;  // ne00 == QK_TBQ, always 1 block per row
+            // Recover the within-row block index used during quantization
+            const int64_t block_in_row = src_idx % s01;
 
             float tmp[QK_TBQ];
             dequantize_f32_tbq3_0_block(&src[src_idx], tmp, block_in_row);
@@ -804,7 +809,7 @@ static __global__ void k_dequantize_nc_tbq4_0(const void * __restrict__ vx,
             const int64_t i03 = dm.x;
 
             const int64_t src_idx = i03*s03 + i02*s02 + i01*s01;
-            const int64_t block_in_row = 0;
+            const int64_t block_in_row = src_idx % s01;
 
             float tmp[QK_TBQ];
             dequantize_f32_tbq4_0_block(&src[src_idx], tmp, block_in_row);

@@ -393,11 +393,18 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         case GGML_TYPE_BF16:
             break;
         // TBQ types: supported via fp16 pre-conversion (contiguous or non-contiguous).
-        // Both ggml_get_to_fp16_cuda and ggml_get_to_fp16_nc_cuda handle TBQ,
-        // so the general path below selects the right kernel (TILE/MMA/VEC).
+        // Route directly to MMA/TILE, never VEC — the VEC kernel dispatches by
+        // K/V type and has no TBQ case.  MMA/TILE pre-convert K/V to fp16 first.
         case GGML_TYPE_TBQ3_0:
-        case GGML_TYPE_TBQ4_0:
-            break;
+        case GGML_TYPE_TBQ4_0: {
+            if (mask && mask->ne[2] != 1) {
+                return BEST_FATTN_KERNEL_NONE;
+            }
+            if (turing_mma_available(cc) && K->ne[0] != 40 && K->ne[0] != 72) {
+                return BEST_FATTN_KERNEL_MMA_F16;
+            }
+            return BEST_FATTN_KERNEL_TILE;
+        }
         default:
             return BEST_FATTN_KERNEL_NONE;
     }

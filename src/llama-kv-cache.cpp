@@ -286,14 +286,21 @@ llama_kv_cache::llama_kv_cache(
         LLAMA_LOG_WARN("%s: attention rotation force disabled (LLAMA_ATTN_ROT_DISABLE)\n", __func__);
     }
 
+    // TBQ types perform their own randomized Hadamard rotation internally,
+    // so skip the external attn_rot to avoid double-rotating.
+    const bool k_is_tbq = (type_k == GGML_TYPE_TBQ3_0 || type_k == GGML_TYPE_TBQ4_0);
+    const bool v_is_tbq = (type_v == GGML_TYPE_TBQ3_0 || type_v == GGML_TYPE_TBQ4_0);
+
     attn_rot_k =
         !attn_rot_disable &&
+        !k_is_tbq &&
         n_embd_head_k_all > 0 &&
         ggml_is_quantized(type_k) &&
         hparams.n_embd_head_k() % 64 == 0;
 
     attn_rot_v =
         !attn_rot_disable &&
+        !v_is_tbq &&
         n_embd_head_v_all > 0 &&
         ggml_is_quantized(type_v) &&
         hparams.n_embd_head_v() % 64 == 0;
