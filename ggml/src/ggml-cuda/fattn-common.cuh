@@ -967,7 +967,13 @@ void launch_fattn(
         const size_t ts = ggml_type_size(K->type);
 
         K_f16.alloc(ggml_nelements(K));
-        if (ggml_is_contiguously_allocated(K)) {
+        // TBQ types must always use the NC (stride-aware) path because the
+        // contiguous path's flat signature can't convey the per-row block index
+        // needed for PRNG seed recovery.  The KV cache view may be contiguously
+        // allocated but still has multi-head stride structure.
+        const bool k_use_nc = !ggml_is_contiguously_allocated(K) ||
+                               K->type == GGML_TYPE_TBQ3_0 || K->type == GGML_TYPE_TBQ4_0;
+        if (!k_use_nc) {
             to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
             to_fp16(K_data, K_f16.ptr, ggml_nelements(K), main_stream);
 
@@ -1000,7 +1006,9 @@ void launch_fattn(
             const size_t ts = ggml_type_size(V->type);
 
             V_f16.alloc(ggml_nelements(V));
-            if (ggml_is_contiguously_allocated(V)) {
+            const bool v_use_nc = !ggml_is_contiguously_allocated(V) ||
+                                   V->type == GGML_TYPE_TBQ3_0 || V->type == GGML_TYPE_TBQ4_0;
+            if (!v_use_nc) {
                 to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
                 to_fp16(V_data, V_f16.ptr, ggml_nelements(V), main_stream);
                 V_data = (char *) V_f16.ptr;
