@@ -2471,22 +2471,10 @@ void quantize_row_tbq3_0_ref(const float * GGML_RESTRICT x, block_tbq3_0 * GGML_
         norm = sqrtf(norm);
         y[i].d = GGML_FP32_TO_FP16(norm);
 
-        // Step 2: normalize and apply randomized Hadamard
+        // Step 2: normalize (external Hadamard rotation is applied by llama.cpp before set_rows)
         float inv_norm = (norm > 1e-10f) ? 1.0f / norm : 0.0f;
         for (int j = 0; j < QK_TBQ; j++) {
             tmp[j] = xb[j] * inv_norm;
-        }
-
-        // Sign flip
-        uint64_t rng = tbq_rot_seed(i);
-        for (int j = 0; j < QK_TBQ; j++) {
-            if (tbq_xorshift64(&rng) & 1) tmp[j] = -tmp[j];
-        }
-        // FWHT + scale
-        tbq_fwht_inplace(tmp, QK_TBQ);
-        float scale = 1.0f / sqrtf((float)QK_TBQ);
-        for (int j = 0; j < QK_TBQ; j++) {
-            tmp[j] *= scale;
         }
 
         // Step 3: nearest centroid (2-bit = 4 centroids)
@@ -2547,19 +2535,10 @@ void quantize_row_tbq4_0_ref(const float * GGML_RESTRICT x, block_tbq4_0 * GGML_
         norm = sqrtf(norm);
         y[i].d = GGML_FP32_TO_FP16(norm);
 
-        // Step 2: normalize and apply randomized Hadamard
+        // Step 2: normalize (external Hadamard rotation is applied by llama.cpp before set_rows)
         float inv_norm = (norm > 1e-10f) ? 1.0f / norm : 0.0f;
         for (int j = 0; j < QK_TBQ; j++) {
             tmp[j] = xb[j] * inv_norm;
-        }
-        uint64_t rng = tbq_rot_seed(i);
-        for (int j = 0; j < QK_TBQ; j++) {
-            if (tbq_xorshift64(&rng) & 1) tmp[j] = -tmp[j];
-        }
-        tbq_fwht_inplace(tmp, QK_TBQ);
-        float scale = 1.0f / sqrtf((float)QK_TBQ);
-        for (int j = 0; j < QK_TBQ; j++) {
-            tmp[j] *= scale;
         }
 
         // Step 3: nearest centroid (3-bit = 8 centroids)
@@ -2645,19 +2624,7 @@ void dequantize_row_tbq3_0(const block_tbq3_0 * GGML_RESTRICT x, float * GGML_RE
             tmp[j] += qjl_scale * acc;
         }
 
-        // Step 3: inverse randomized Hadamard
-        float scale = 1.0f / sqrtf((float)QK_TBQ);
-        for (int j = 0; j < QK_TBQ; j++) {
-            tmp[j] *= scale;
-        }
-        tbq_fwht_inplace(tmp, QK_TBQ);
-
-        uint64_t rng = tbq_rot_seed(i);
-        for (int j = 0; j < QK_TBQ; j++) {
-            if (tbq_xorshift64(&rng) & 1) tmp[j] = -tmp[j];
-        }
-
-        // Step 4: scale by norm
+        // Step 3: scale by norm (no inverse rotation — external rotation is never inverted)
         for (int j = 0; j < QK_TBQ; j++) {
             y[i * QK_TBQ + j] = d_norm * tmp[j];
         }
@@ -2703,19 +2670,7 @@ void dequantize_row_tbq4_0(const block_tbq4_0 * GGML_RESTRICT x, float * GGML_RE
             tmp[j] += qjl_scale * acc;
         }
 
-        // Step 3: inverse randomized Hadamard
-        float scale = 1.0f / sqrtf((float)QK_TBQ);
-        for (int j = 0; j < QK_TBQ; j++) {
-            tmp[j] *= scale;
-        }
-        tbq_fwht_inplace(tmp, QK_TBQ);
-
-        uint64_t rng = tbq_rot_seed(i);
-        for (int j = 0; j < QK_TBQ; j++) {
-            if (tbq_xorshift64(&rng) & 1) tmp[j] = -tmp[j];
-        }
-
-        // Step 4: scale by norm
+        // Step 3: scale by norm (no inverse rotation — external rotation is never inverted)
         for (int j = 0; j < QK_TBQ; j++) {
             y[i * QK_TBQ + j] = d_norm * tmp[j];
         }
