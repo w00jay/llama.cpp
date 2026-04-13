@@ -222,13 +222,14 @@ static __device__ void quantize_f32_tbq4_0_block(const float * __restrict__ x,
 // --- TBQ dequantize device functions ---
 // Each call reconstructs one QK_TBQ-element vector from a single TBQ block.
 // block_idx must match what was passed during quantization (same PRNG seeds).
+// skip_qjl: when true, skip QJL reconstruction (for V vectors where noise hurts quality).
 
 static __device__ void dequantize_f32_tbq3_0_block(const block_tbq3_0 * __restrict__ x,
                                                      float * __restrict__ y,
-                                                     int64_t block_idx) {
+                                                     int64_t block_idx,
+                                                     bool skip_qjl = false) {
     const float cb[4] = { -1.335033e-01f, -4.002048e-02f, 4.002048e-02f, 1.335033e-01f };
     const float d_norm = __half2float(x->d);
-    const float gamma  = __half2float(x->gamma);
     const float block_scale = __half2float(x->s);
 
     float tmp[QK_TBQ];
@@ -239,23 +240,26 @@ static __device__ void dequantize_f32_tbq3_0_block(const block_tbq3_0 * __restri
         tmp[j] = block_scale * cb[idx];
     }
 
-    // Step 2: QJL reconstruction (scaled) — compute S^T * qjl_signs column-wise (O(d^2))
-    float acc[QK_TBQ];
-    for (int j = 0; j < QK_TBQ; j++) acc[j] = 0.0f;
+    // Step 2: QJL reconstruction (skipped for V vectors — noise hurts weighted sums)
+    if (!skip_qjl) {
+        const float gamma = __half2float(x->gamma);
+        float acc[QK_TBQ];
+        for (int j = 0; j < QK_TBQ; j++) acc[j] = 0.0f;
 
-    for (int l = 0; l < QK_TBQ; l++) {
-        float sign = ((x->qjl[l / 8] >> (l % 8)) & 1) ? 1.0f : -1.0f;
-        uint64_t srng = tbq_qjl_seed_cuda(block_idx, l);
-        for (int j = 0; j < QK_TBQ; j++) {
-            srng = tbq_xorshift64_cuda(srng);
-            float s_lj = (srng & 1) ? 1.0f : -1.0f;
-            acc[j] += s_lj * sign;
+        for (int l = 0; l < QK_TBQ; l++) {
+            float sign = ((x->qjl[l / 8] >> (l % 8)) & 1) ? 1.0f : -1.0f;
+            uint64_t srng = tbq_qjl_seed_cuda(block_idx, l);
+            for (int j = 0; j < QK_TBQ; j++) {
+                srng = tbq_xorshift64_cuda(srng);
+                float s_lj = (srng & 1) ? 1.0f : -1.0f;
+                acc[j] += s_lj * sign;
+            }
         }
-    }
 
-    const float qjl_scale = block_scale * sqrtf((float)M_PI / 2.0f) / (float)QK_TBQ * gamma;
-    for (int j = 0; j < QK_TBQ; j++) {
-        tmp[j] += qjl_scale * acc[j];
+        const float qjl_scale = block_scale * sqrtf((float)M_PI / 2.0f) / (float)QK_TBQ * gamma;
+        for (int j = 0; j < QK_TBQ; j++) {
+            tmp[j] += qjl_scale * acc[j];
+        }
     }
 
     // Step 3: undo sign-flip (D² = I)
@@ -273,13 +277,13 @@ static __device__ void dequantize_f32_tbq3_0_block(const block_tbq3_0 * __restri
 
 static __device__ void dequantize_f32_tbq4_0_block(const block_tbq4_0 * __restrict__ x,
                                                      float * __restrict__ y,
-                                                     int64_t block_idx) {
+                                                     int64_t block_idx,
+                                                     bool skip_qjl = false) {
     const float cb[8] = {
         -1.902069e-01f, -1.187859e-01f, -6.682206e-02f, -2.166347e-02f,
          2.166347e-02f,  6.682206e-02f,  1.187859e-01f,  1.902069e-01f,
     };
     const float d_norm = __half2float(x->d);
-    const float gamma  = __half2float(x->gamma);
     const float block_scale = __half2float(x->s);
 
     float tmp[QK_TBQ];
@@ -297,23 +301,26 @@ static __device__ void dequantize_f32_tbq4_0_block(const block_tbq4_0 * __restri
         tmp[j] = block_scale * cb[idx];
     }
 
-    // Step 2: QJL reconstruction (scaled) — compute S^T * qjl_signs column-wise (O(d^2))
-    float acc[QK_TBQ];
-    for (int j = 0; j < QK_TBQ; j++) acc[j] = 0.0f;
+    // Step 2: QJL reconstruction (skipped for V vectors)
+    if (!skip_qjl) {
+        const float gamma = __half2float(x->gamma);
+        float acc[QK_TBQ];
+        for (int j = 0; j < QK_TBQ; j++) acc[j] = 0.0f;
 
-    for (int l = 0; l < QK_TBQ; l++) {
-        float sign = ((x->qjl[l / 8] >> (l % 8)) & 1) ? 1.0f : -1.0f;
-        uint64_t srng = tbq_qjl_seed_cuda(block_idx, l);
-        for (int j = 0; j < QK_TBQ; j++) {
-            srng = tbq_xorshift64_cuda(srng);
-            float s_lj = (srng & 1) ? 1.0f : -1.0f;
-            acc[j] += s_lj * sign;
+        for (int l = 0; l < QK_TBQ; l++) {
+            float sign = ((x->qjl[l / 8] >> (l % 8)) & 1) ? 1.0f : -1.0f;
+            uint64_t srng = tbq_qjl_seed_cuda(block_idx, l);
+            for (int j = 0; j < QK_TBQ; j++) {
+                srng = tbq_xorshift64_cuda(srng);
+                float s_lj = (srng & 1) ? 1.0f : -1.0f;
+                acc[j] += s_lj * sign;
+            }
         }
-    }
 
-    const float qjl_scale = block_scale * sqrtf((float)M_PI / 2.0f) / (float)QK_TBQ * gamma;
-    for (int j = 0; j < QK_TBQ; j++) {
-        tmp[j] += qjl_scale * acc[j];
+        const float qjl_scale = block_scale * sqrtf((float)M_PI / 2.0f) / (float)QK_TBQ * gamma;
+        for (int j = 0; j < QK_TBQ; j++) {
+            tmp[j] += qjl_scale * acc[j];
+        }
     }
 
     // Step 3: undo sign-flip (D² = I)

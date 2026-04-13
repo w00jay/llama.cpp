@@ -1102,12 +1102,9 @@ void launch_fattn(
         const size_t ts = ggml_type_size(K->type);
 
         K_f16.alloc(ggml_nelements(K));
-        // TBQ types must always use the NC (stride-aware) path because the
-        // contiguous path's flat signature can't convey the per-row block index
-        // needed for PRNG seed recovery.  The KV cache view may be contiguously
-        // allocated but still has multi-head stride structure.
-        const bool k_use_nc = !ggml_is_contiguously_allocated(K) ||
-                               K->type == GGML_TYPE_TBQ3_0 || K->type == GGML_TYPE_TBQ4_0;
+        // TBQ types must always use the NC (stride-aware) path.
+        const bool k_is_tbq = K->type == GGML_TYPE_TBQ3_0 || K->type == GGML_TYPE_TBQ4_0;
+        const bool k_use_nc = !ggml_is_contiguously_allocated(K) || k_is_tbq;
         if (!k_use_nc) {
             to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
             to_fp16(K_data, K_f16.ptr, ggml_nelements(K), main_stream);
@@ -1117,11 +1114,22 @@ void launch_fattn(
             nb13 = nb13*bs*sizeof(half)/ts;
         } else {
             GGML_ASSERT(K->nb[0] == ts);
-            to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(K->type);
             const int64_t s01 = nb11 / ts;
             const int64_t s02 = nb12 / ts;
             const int64_t s03 = nb13 / ts;
-            to_fp16(K_data, K_f16.ptr, K->ne[0], K->ne[1], K->ne[2], K->ne[3], s01, s02, s03, main_stream);
+            // TBQ K pre-conversion: also skip QJL (fused VEC handles QJL directly)
+            if (k_is_tbq) {
+                if (K->type == GGML_TYPE_TBQ3_0) {
+                    dequantize_nc_tbq3_0_noqjl_cuda_f16(K_data, K_f16.ptr,
+                        K->ne[0], K->ne[1], K->ne[2], K->ne[3], s01, s02, s03, main_stream);
+                } else {
+                    dequantize_nc_tbq4_0_noqjl_cuda_f16(K_data, K_f16.ptr,
+                        K->ne[0], K->ne[1], K->ne[2], K->ne[3], s01, s02, s03, main_stream);
+                }
+            } else {
+                to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(K->type);
+                to_fp16(K_data, K_f16.ptr, K->ne[0], K->ne[1], K->ne[2], K->ne[3], s01, s02, s03, main_stream);
+            }
 
             nb11 = K->ne[0] * sizeof(half);
             nb12 = K->ne[1] * nb11;
@@ -1141,8 +1149,8 @@ void launch_fattn(
             const size_t ts = ggml_type_size(V->type);
 
             V_f16.alloc(ggml_nelements(V));
-            const bool v_use_nc = !ggml_is_contiguously_allocated(V) ||
-                                   V->type == GGML_TYPE_TBQ3_0 || V->type == GGML_TYPE_TBQ4_0;
+            const bool v_is_tbq = V->type == GGML_TYPE_TBQ3_0 || V->type == GGML_TYPE_TBQ4_0;
+            const bool v_use_nc = !ggml_is_contiguously_allocated(V) || v_is_tbq;
             if (!v_use_nc) {
                 to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
                 to_fp16(V_data, V_f16.ptr, ggml_nelements(V), main_stream);
@@ -1153,11 +1161,22 @@ void launch_fattn(
                 nb23 = nb23*bs*sizeof(half)/ts;
             } else {
                 GGML_ASSERT(V->nb[0] == ts);
-                to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(V->type);
                 const int64_t s01 = nb21 / ts;
                 const int64_t s02 = nb22 / ts;
                 const int64_t s03 = nb23 / ts;
-                to_fp16(V_data, V_f16.ptr, V->ne[0], V->ne[1], V->ne[2], V->ne[3], s01, s02, s03, main_stream);
+                // TBQ V: use no-QJL dequant (QJL noise hurts weighted sums)
+                if (v_is_tbq) {
+                    if (V->type == GGML_TYPE_TBQ3_0) {
+                        dequantize_nc_tbq3_0_noqjl_cuda_f16(V_data, V_f16.ptr,
+                            V->ne[0], V->ne[1], V->ne[2], V->ne[3], s01, s02, s03, main_stream);
+                    } else {
+                        dequantize_nc_tbq4_0_noqjl_cuda_f16(V_data, V_f16.ptr,
+                            V->ne[0], V->ne[1], V->ne[2], V->ne[3], s01, s02, s03, main_stream);
+                    }
+                } else {
+                    to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(V->type);
+                    to_fp16(V_data, V_f16.ptr, V->ne[0], V->ne[1], V->ne[2], V->ne[3], s01, s02, s03, main_stream);
+                }
 
                 nb21 = V->ne[0] * sizeof(half);
                 nb22 = V->ne[1] * nb21;

@@ -765,7 +765,7 @@ static void dequantize_row_tbq4_0_cuda(const void * vx, dst_t * y, const int64_t
 // the cache row (0..n_head_kv-1).  FA reads the cache as [head_dim, kv_size, n_heads]
 // with s01 = n_head_kv blocks.  The within-row block position = src_idx % s01.
 
-template<typename dst_t>
+template<typename dst_t, bool skip_qjl = false>
 static __global__ void k_dequantize_nc_tbq3_0(const void * __restrict__ vx,
                                                 dst_t * __restrict__ y,
                                                 const int64_t ne01,
@@ -780,11 +780,10 @@ static __global__ void k_dequantize_nc_tbq3_0(const void * __restrict__ vx,
             const int64_t i03 = dm.x;
 
             const int64_t src_idx = i03*s03 + i02*s02 + i01*s01;
-            // Recover the within-row block index used during quantization
             const int64_t block_in_row = src_idx % s01;
 
             float tmp[QK_TBQ];
-            dequantize_f32_tbq3_0_block(&src[src_idx], tmp, block_in_row);
+            dequantize_f32_tbq3_0_block(&src[src_idx], tmp, block_in_row, skip_qjl);
 
             dst_t * y_block = y + (i0203*ne01 + i01) * QK_TBQ;
             for (int j = 0; j < QK_TBQ; j++) {
@@ -794,7 +793,7 @@ static __global__ void k_dequantize_nc_tbq3_0(const void * __restrict__ vx,
     }
 }
 
-template<typename dst_t>
+template<typename dst_t, bool skip_qjl = false>
 static __global__ void k_dequantize_nc_tbq4_0(const void * __restrict__ vx,
                                                 dst_t * __restrict__ y,
                                                 const int64_t ne01,
@@ -812,7 +811,7 @@ static __global__ void k_dequantize_nc_tbq4_0(const void * __restrict__ vx,
             const int64_t block_in_row = src_idx % s01;
 
             float tmp[QK_TBQ];
-            dequantize_f32_tbq4_0_block(&src[src_idx], tmp, block_in_row);
+            dequantize_f32_tbq4_0_block(&src[src_idx], tmp, block_in_row, skip_qjl);
 
             dst_t * y_block = y + (i0203*ne01 + i01) * QK_TBQ;
             for (int j = 0; j < QK_TBQ; j++) {
@@ -845,6 +844,31 @@ static void dequantize_nc_tbq4_0_cuda(const void * vx, dst_t * y,
     const dim3 num_blocks(1, (int)std::min(ne01, (int64_t)65535),
                              (int)std::min(ne0203, (int64_t)65535));
     k_dequantize_nc_tbq4_0<<<num_blocks, 1, 0, stream>>>(
+        vx, y, ne01, ne0203, ne02_fdv, s01, s02, s03);
+}
+
+// No-QJL variants for V dequant (QJL noise hurts weighted sums)
+void dequantize_nc_tbq3_0_noqjl_cuda_f16(const void * vx, half * y,
+        int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
+        int64_t s01, int64_t s02, int64_t s03, cudaStream_t stream) {
+    GGML_ASSERT(ne00 == QK_TBQ);
+    const int64_t ne0203 = ne02 * ne03;
+    const uint3 ne02_fdv = init_fastdiv_values(ne02);
+    const dim3 num_blocks(1, (int)std::min(ne01, (int64_t)65535),
+                             (int)std::min(ne0203, (int64_t)65535));
+    k_dequantize_nc_tbq3_0<half, true><<<num_blocks, 1, 0, stream>>>(
+        vx, y, ne01, ne0203, ne02_fdv, s01, s02, s03);
+}
+
+void dequantize_nc_tbq4_0_noqjl_cuda_f16(const void * vx, half * y,
+        int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
+        int64_t s01, int64_t s02, int64_t s03, cudaStream_t stream) {
+    GGML_ASSERT(ne00 == QK_TBQ);
+    const int64_t ne0203 = ne02 * ne03;
+    const uint3 ne02_fdv = init_fastdiv_values(ne02);
+    const dim3 num_blocks(1, (int)std::min(ne01, (int64_t)65535),
+                             (int)std::min(ne0203, (int64_t)65535));
+    k_dequantize_nc_tbq4_0<half, true><<<num_blocks, 1, 0, stream>>>(
         vx, y, ne01, ne0203, ne02_fdv, s01, s02, s03);
 }
 
