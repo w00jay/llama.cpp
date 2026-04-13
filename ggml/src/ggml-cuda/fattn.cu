@@ -212,7 +212,9 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
 #define FATTN_VEC_CASE(D, type_K, type_V)                                                                        \
     {                                                                                                            \
         const bool type_K_okay = K->type == (type_K) || (K->type == GGML_TYPE_F32 && (type_K) == GGML_TYPE_F16); \
-        const bool type_V_okay = V->type == (type_V) || (V->type == GGML_TYPE_F32 && (type_V) == GGML_TYPE_F16); \
+        const bool type_V_okay = V->type == (type_V) || (V->type == GGML_TYPE_F32 && (type_V) == GGML_TYPE_F16)  \
+            || ((V->type == GGML_TYPE_TBQ3_0 || V->type == GGML_TYPE_TBQ4_0)                                     \
+                && (type_V) == GGML_TYPE_F16);                                                                    \
         if (Q->ne[0] == (D) && type_K_okay && type_V_okay) {                                                     \
             ggml_cuda_flash_attn_ext_vec_case<D, type_K, type_V>(ctx, dst);                                      \
             return;                                                                                              \
@@ -291,6 +293,11 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
 #endif // GGML_CUDA_FA_ALL_QUANTS
+
+    // TBQ types: fused K·Q dot product in VEC, V pre-converted to f16.
+    // Only D=128 (TBQ block size = head dimension).
+    FATTN_VEC_CASE(128, GGML_TYPE_TBQ3_0, GGML_TYPE_F16)
+    FATTN_VEC_CASE(128, GGML_TYPE_TBQ4_0, GGML_TYPE_F16)
 
     GGML_ABORT("fatal error");
 }
@@ -392,14 +399,18 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_BF16:
             break;
-        // TBQ types: supported via fp16 pre-conversion (contiguous or non-contiguous).
-        // Route directly to MMA/TILE, never VEC — the VEC kernel dispatches by
-        // K/V type and has no TBQ case.  MMA/TILE pre-convert K/V to fp16 first.
+        // TBQ types: fused K·Q dot product via VEC kernel for decode,
+        // MMA/TILE with fp16 pre-conversion for batched prefill.
         case GGML_TYPE_TBQ3_0:
         case GGML_TYPE_TBQ4_0: {
             if (mask && mask->ne[2] != 1) {
                 return BEST_FATTN_KERNEL_NONE;
             }
+            // VEC: fused TBQ dot product (no K dequant), best for decode
+            if (Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0 && Q->ne[1] <= 2) {
+                return BEST_FATTN_KERNEL_VEC;
+            }
+            // Prefill fallback: pre-convert K/V to fp16, use MMA/TILE
             if (turing_mma_available(cc) && K->ne[0] != 40 && K->ne[0] != 72) {
                 return BEST_FATTN_KERNEL_MMA_F16;
             }

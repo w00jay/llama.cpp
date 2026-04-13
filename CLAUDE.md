@@ -71,8 +71,11 @@ g++ -std=c++17 -O2 -o test-tbq-math tests/test-tbq-math.cpp -lm && ./test-tbq-ma
   contiguous and non-contiguous (NC) dequant kernels in convert.cu, routed to MMA/TILE
   kernels via the general FA path in fattn.cu. 4/4 TBQ FLASH_ATTN_EXT tests pass on GPU,
   2838 total FA tests OK, 0 FAIL. Files: tbq-quants.cuh, convert.cu, fattn.cu.
-- **Phase 4** — Pending. Benchmarks.
-- **Phase 5** — Pending. Optimization.
+- **Phase 4** — Skipped (benchmarking deferred until fused kernel proves TBQ's value).
+- **Phase 5** — IN PROGRESS. Fused VEC kernel for decode: `vec_dot_fattn_vec_KQ_tbq3_0/4_0`
+  computes attention scores directly from TBQ-compressed K without dequant. Internal rotation
+  removed (relies on llama.cpp external Hadamard). PPL on Llama-3.1-8B: TBQ4=9.65, TBQ3=18.27
+  (vs f16=5.46, q4_0=5.53). Quality gap due to fixed global codebook vs q4_0's adaptive scale.
 
 ## Key Files
 

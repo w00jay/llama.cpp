@@ -3,6 +3,7 @@
 #include "common.cuh"
 #include "convert.cuh"
 #include "vecdotq.cuh"
+#include "tbq-quants.cuh"
 
 #include <cstdint>
 
@@ -286,6 +287,114 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q8_0(
     }
 
     return sum;
+}
+
+// --- TBQ fused K·Q dot products ---
+// Compute attention score directly from TBQ-compressed K, avoiding full dequant.
+// Q_v is the query as half2 (populated when Q_q8_1 = false for TBQ types).
+// score = d_norm * (dot(q, centroids[idx]) + sqrt(pi/2)/d * gamma * dot_qjl)
+
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq3_0(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    static_assert(D == 128, "TBQ requires D=128");
+    const block_tbq3_0 * K_tbq = (const block_tbq3_0 *) K_c;
+    const half * Q_h = (const half *) Q_v;
+    GGML_UNUSED(Q_q8);
+    GGML_UNUSED(Q_ds_v);
+
+    constexpr float cb4[4] = { -1.335033e-01f, -4.002048e-02f, 4.002048e-02f, 1.335033e-01f };
+    const float d_norm = __half2float(K_tbq->d);
+    const float gamma  = __half2float(K_tbq->gamma);
+
+    // Part 1: dot(q, centroids[idx]) — each thread handles D/nthreads coordinates
+    float dot_centroid = 0.0f;
+    for (int j0 = 0; j0 < D; j0 += nthreads) {
+        const int j = j0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+        if (j < D) {
+            const int idx = (K_tbq->idx[j / 4] >> (2 * (j % 4))) & 3;
+            dot_centroid += cb4[idx] * __half2float(Q_h[j]);
+        }
+    }
+
+    // Part 2: QJL correction — each thread handles a subset of QJL bits
+    // For each QJL bit j: qjl_sign_j * dot(S_row_j, q)
+    // where S_row_j is a Rademacher row seeded per (block_in_row=0, j)
+    float dot_qjl = 0.0f;
+    for (int j0 = 0; j0 < QK_TBQ; j0 += nthreads) {
+        const int j = j0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+        if (j < QK_TBQ) {
+            const float qjl_sign = ((K_tbq->qjl[j / 8] >> (j % 8)) & 1) ? 1.0f : -1.0f;
+            // dot(S_row_j, q) = sum_l S[j][l] * q[l]
+            uint64_t srng = tbq_qjl_seed_cuda(0, j);
+            float s_dot_q = 0.0f;
+            for (int l = 0; l < QK_TBQ; l++) {
+                srng = tbq_xorshift64_cuda(srng);
+                const float s_jl = (srng & 1) ? 1.0f : -1.0f;
+                s_dot_q += s_jl * __half2float(Q_h[l]);
+            }
+            dot_qjl += qjl_sign * s_dot_q;
+        }
+    }
+
+    const float qjl_scale = sqrtf((float)M_PI / 2.0f) / (float)QK_TBQ * gamma;
+    return d_norm * (dot_centroid + qjl_scale * dot_qjl);
+}
+
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq4_0(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    static_assert(D == 128, "TBQ requires D=128");
+    const block_tbq4_0 * K_tbq = (const block_tbq4_0 *) K_c;
+    const half * Q_h = (const half *) Q_v;
+    GGML_UNUSED(Q_q8);
+    GGML_UNUSED(Q_ds_v);
+
+    constexpr float cb8[8] = {
+        -1.902069e-01f, -1.187859e-01f, -6.682206e-02f, -2.166347e-02f,
+         2.166347e-02f,  6.682206e-02f,  1.187859e-01f,  1.902069e-01f,
+    };
+    const float d_norm = __half2float(K_tbq->d);
+    const float gamma  = __half2float(K_tbq->gamma);
+
+    // Part 1: dot(q, centroids[idx]) — 3-bit indices
+    float dot_centroid = 0.0f;
+    for (int j0 = 0; j0 < D; j0 += nthreads) {
+        const int j = j0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+        if (j < D) {
+            const int bit_pos  = j * 3;
+            const int byte_pos = bit_pos / 8;
+            const int bit_off  = bit_pos % 8;
+            int idx = (K_tbq->idx[byte_pos] >> bit_off);
+            if (bit_off + 3 > 8) {
+                idx |= ((int)K_tbq->idx[byte_pos + 1] << (8 - bit_off));
+            }
+            idx &= 7;
+            dot_centroid += cb8[idx] * __half2float(Q_h[j]);
+        }
+    }
+
+    // Part 2: QJL correction (identical to TBQ3)
+    float dot_qjl = 0.0f;
+    for (int j0 = 0; j0 < QK_TBQ; j0 += nthreads) {
+        const int j = j0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+        if (j < QK_TBQ) {
+            const float qjl_sign = ((K_tbq->qjl[j / 8] >> (j % 8)) & 1) ? 1.0f : -1.0f;
+            uint64_t srng = tbq_qjl_seed_cuda(0, j);
+            float s_dot_q = 0.0f;
+            for (int l = 0; l < QK_TBQ; l++) {
+                srng = tbq_xorshift64_cuda(srng);
+                const float s_jl = (srng & 1) ? 1.0f : -1.0f;
+                s_dot_q += s_jl * __half2float(Q_h[l]);
+            }
+            dot_qjl += qjl_sign * s_dot_q;
+        }
+    }
+
+    const float qjl_scale = sqrtf((float)M_PI / 2.0f) / (float)QK_TBQ * gamma;
+    return d_norm * (dot_centroid + qjl_scale * dot_qjl);
 }
 
 template <typename Tds, int ni>
@@ -593,6 +702,10 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_q8_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_BF16) {
         return vec_dot_fattn_vec_KQ_bf16<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TBQ3_0) {
+        return vec_dot_fattn_vec_KQ_tbq3_0<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TBQ4_0) {
+        return vec_dot_fattn_vec_KQ_tbq4_0<D, nthreads>;
     } else {
         static_assert(type_K == -1, "bad type");
         return nullptr;
