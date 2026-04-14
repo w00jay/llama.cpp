@@ -91,9 +91,19 @@ implementations (llama.cpp #20969, #21089, 0xSero/turboquant) revealed:
 5. **K/V norm asymmetry is huge** — Qwen models have K/V ratio of 100-180x. Single codebook
    can't serve both. Asymmetric K/V is the standard approach.
 
+### Trial 8: QJL dropped, full-bit Lloyd-Max MSE codebooks
+- Commit: `b57eefb93`
+- Config: Removed QJL entirely. TBQ3: 3-bit (8 centroids), TBQ4: 4-bit (16 centroids).
+  Block sizes unchanged (52/68 bytes) since QJL+gamma bytes replaced by more idx bits.
+- **TBQ4_0: PPL = 8.93** (was 9.53, -6.3%)
+- **TBQ3_0: PPL = 9.53** (was 13.54, **-30%**)
+- TBQ3 at 3.25 bpw now matches what TBQ4 was before QJL removal!
+- TBQ4 at 4.25 bpw closing gap to q4_0 (8.93 vs 5.53)
+- -424 lines of QJL code removed. Much simpler codebase.
+
 ## Recommended Next Steps
 
-1. **Drop QJL entirely** — repurpose the 1 QJL bit as an additional centroid bit.
+1. ~~Drop QJL entirely~~ DONE (Trial 8) — massive TBQ3 improvement.
    TBQ3: 2-bit → 3-bit centroids (4→8 levels). TBQ4: 3-bit → 4-bit centroids (8→16 levels).
    Remove qjl[] from struct, gamma field, QJL PRNG code.
 2. **Use q4_0 for V** — standard group quantization. TBQ K + q4_0 V via VEC kernel.
