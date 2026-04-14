@@ -157,7 +157,7 @@ type == GGML_TYPE_TBQ3_0 || type == GGML_TYPE_TBQ4_0
 
 ## Verification
 
-1. **Build:** `cmake --build build -j$(nproc)` on dell box (192.168.1.91)
+1. **Build:** `cmake --build build -j$(nproc)` on build server
 2. **FA tests:** `LD_LIBRARY_PATH=build/bin CUDA_VISIBLE_DEVICES=1 ./build/bin/test-backend-ops -o FLASH_ATTN_EXT 2>&1 | grep tbq`
    - Expected: TBQ tests show `OK` (not "not supported")
 3. **SET_ROWS regression:** `LD_LIBRARY_PATH=build/bin CUDA_VISIBLE_DEVICES=1 ./build/bin/test-backend-ops -o SET_ROWS`

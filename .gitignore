@@ -145,3 +145,11 @@ poetry.toml
 /.windsurf/
 # emscripten
 a.out.*
+
+# Claude Code auto-generated context files (keep root CLAUDE.md only)
+src/CLAUDE.md
+common/CLAUDE.md
+ggml/**/CLAUDE.md
+include/CLAUDE.md
+tests/CLAUDE.md
+llama.cpp/

@@ -197,7 +197,7 @@ case GGML_TYPE_TBQ4_0: {
 
 ## Verification
 
-1. **Build** on dell box with CUDA
+1. **Build** on build server with CUDA
 2. **FA tests:** `test-backend-ops -o FLASH_ATTN_EXT | grep tbq` — all 4 OK
 3. **SET_ROWS:** 141/141 still pass
 4. **Perplexity:** Compare PPL for TBQ3/TBQ4 vs current (should be same or better — the

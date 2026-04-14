@@ -44,7 +44,7 @@ The fused dot function reads `tbq_kv_head` from shared memory to seed the sign-f
 
 ## Verification
 
-1. Build on dell box
+1. Build on build server
 2. FA tests: 4/4 TBQ OK
 3. PPL: TBQ4 should improve from 9.65 toward 5.5-6.5
 4. SET_ROWS: 141/141 pass

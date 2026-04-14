@@ -1,6 +1,6 @@
 # TBQ Build Times Log
 
-Machine: Dell R730xd, 56 cores, 125GB RAM, CUDA 12.5
+Machine: Build server, 56 cores, 125GB RAM, CUDA 12.5
 GPU target: sm_86 only (RTX 3090)
 
 ## Build Times
