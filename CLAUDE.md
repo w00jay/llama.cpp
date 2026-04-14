@@ -28,20 +28,33 @@ implementation plan with phases, file targets, struct layouts, and algorithms.
 
 ## Key Architecture Decisions
 
-- **Rotation:** Randomized Hadamard transform (sign-flip + FWHT), NOT random
-  orthogonal matrix. O(d log d) vs O(d^2), and llama.cpp already uses Hadamard.
-- **QJL matrix:** Rademacher (+/-1) generated on-the-fly from seeded PRNG,
-  never stored. Equivalent JL guarantee, much faster than Gaussian.
+- **Rotation:** External WHT (llama.cpp's `attn_rot_k/v`) + internal random sign-flip
+  (SRHT). The sign-flip makes coordinates ~N(0, 1/d) for optimal codebook fit.
+  No FWHT inside TBQ — external rotation handles that.
+- **QJL:** Rademacher (+/-1) generated on-the-fly from seeded PRNG. Used for K
+  attention scores (fused VEC dot), **skipped for V** (QJL noise hurts weighted sums).
+- **Per-block scale:** fp16 scale factor adapts codebook to actual coordinate variance.
 - **Block size:** QK_TBQ = 128 (matches head dimension of Llama/Mistral/Qwen).
-  This is a hard constraint — models with non-128 head dims won't work.
-- **Types:** GGML_TYPE_TBQ3_0 (3-bit, ~5x compression) and GGML_TYPE_TBQ4_0
-  (4-bit, ~3.8x compression).
+  Hard constraint — models with non-128 head dims won't work.
+- **Types:** GGML_TYPE_TBQ3_0 (3.38 bpw, 54 bytes/128 elem) and GGML_TYPE_TBQ4_0
+  (4.38 bpw, 70 bytes/128 elem). Includes norm, gamma, scale, indices, QJL signs.
 
 ## Build
 
 ```bash
-cmake -B build -DGGML_CUDA=ON   # or -DGGML_METAL=ON for Mac
-cmake --build build -j$(nproc)
+cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86  # RTX 3090 only
+cmake --build build -j4   # -j2 for fattn.cu changes, never higher (OOM risk)
+```
+
+**Build time warning:** fattn.cu VEC template instantiations are extremely slow.
+Each `FATTN_VEC_CASE` takes ~20+ min to compile. ptxas can use 36GB+ RAM.
+TBQ VEC cases should go in `template-instances/fattn-vec-instance-tbq*.cu` files
+(separate compilation units) not inline in fattn.cu. See [PLANS/build-times.md](PLANS/build-times.md).
+
+Dell box (192.168.1.91): use GPU UUID for 3090:
+```bash
+export CUDA_VISIBLE_DEVICES=GPU-d5346770-8aa7-8069-e875-bf874014dfaa
+export LD_LIBRARY_PATH=build/bin
 ```
 
 ## Test
@@ -72,10 +85,16 @@ g++ -std=c++17 -O2 -o test-tbq-math tests/test-tbq-math.cpp -lm && ./test-tbq-ma
   kernels via the general FA path in fattn.cu. 4/4 TBQ FLASH_ATTN_EXT tests pass on GPU,
   2838 total FA tests OK, 0 FAIL. Files: tbq-quants.cuh, convert.cu, fattn.cu.
 - **Phase 4** — Skipped (benchmarking deferred until fused kernel proves TBQ's value).
-- **Phase 5** — IN PROGRESS. Fused VEC kernel for decode: `vec_dot_fattn_vec_KQ_tbq3_0/4_0`
-  computes attention scores directly from TBQ-compressed K without dequant. Internal rotation
-  removed (relies on llama.cpp external Hadamard). PPL on Llama-3.1-8B: TBQ4=9.65, TBQ3=18.27
-  (vs f16=5.46, q4_0=5.53). Quality gap due to fixed global codebook vs q4_0's adaptive scale.
+- **Phase 5** — IN PROGRESS. Key results:
+  - Fused VEC kernel: `vec_dot_fattn_vec_KQ_tbq3_0/4_0` computes attention scores
+    directly from TBQ K without dequant (decode path)
+  - Removed internal FWHT rotation; uses llama.cpp external WHT + internal sign-flip (SRHT)
+  - Added per-block adaptive scale (fp16 `s` field in struct)
+  - **Asymmetric QJL**: skip QJL in V dequant (noise hurts weighted sums)
+  - Parallelized NC dequant kernel (128 threads per block)
+  - PPL (10-chunk, Llama-3.1-8B-Q6K): TBQ4=9.53, TBQ3=13.54 (vs f16=5.46, q4_0=5.53)
+  - Asymmetric K/V (TBQ K + q4_0 V) in progress — expected PPL ~5.5-6.0
+  - See [PLANS/quality-trials.md](PLANS/quality-trials.md) for full experiment log
 
 ## Key Files
 
@@ -96,8 +115,11 @@ g++ -std=c++17 -O2 -o test-tbq-math tests/test-tbq-math.cpp -lm && ./test-tbq-ma
 - `tests/test-backend-ops.cpp` — TBQ SET_ROWS test cases
 
 ### New files we create
-- `ggml/src/ggml-cuda/tbq-quants.cuh` — CUDA TBQ device functions
+- `ggml/src/ggml-cuda/tbq-quants.cuh` — CUDA TBQ device functions (quantize, dequant, PRNG)
+- `ggml/src/ggml-cuda/template-instances/fattn-vec-instance-tbq*.cu` — VEC template instances (TODO)
 - `tests/test-tbq-math.cpp` — standalone algorithm tests (Phase 0, all passing)
+- `PLANS/quality-trials.md` — PPL experiment log with all trials and findings
+- `PLANS/build-times.md` — CUDA build time tracking and optimization notes
 
 ### Reference files (read these to understand patterns)
 - `ggml/src/ggml-common.h:177-200` — block_q1_0, block_q4_0 struct patterns
@@ -116,26 +138,29 @@ Follow llama.cpp conventions (see llama.cpp/CONTRIBUTING.md):
 - Prefix names with module: `tbq_`, `block_tbq3_0`, etc.
 - Keep CUDA kernels self-contained with device functions in .cuh files
 
-## Algorithm Quick Reference
+## Algorithm Quick Reference (current implementation)
 
-### TurboQuant_prod quantize (b=3, d=128):
-1. `d_norm = ||x||; x_hat = x / d_norm`
-2. `x_rot = (1/sqrt(d)) * FWHT(sign_flip * x_hat)` — randomized Hadamard
-3. For each coord j: `idx[j] = nearest_centroid_2bit(x_rot[j])` — 4 centroids for N(0,1/d)
-4. `r = x_rot - centroids[idx]` — residual in rotated domain
-5. `gamma = ||r||`
-6. For each coord j: `qjl[j] = sign(dot(S_row_j, r))` — Rademacher PRNG for S rows
-7. Store: `{d_norm, gamma, idx[128], qjl[128]}`
+### Quantize (set_rows path, b=3 example, d=128):
+1. `d_norm = ||x||; x_hat = x / d_norm` — normalize (external WHT already applied)
+2. `x_sf = sign_flip(x_hat)` — per-block Rademacher diagonal (SRHT completion)
+3. `s = rms(x_sf) / sqrt(1/d)` — per-block adaptive scale
+4. `x_scaled = x_sf / s`
+5. For each coord j: `idx[j] = nearest_centroid_2bit(x_scaled[j])` — 4 centroids for N(0,1/d)
+6. `r = x_scaled - centroids[idx]` — residual in scaled domain
+7. `gamma = ||r||`
+8. For each coord j: `qjl[j] = sign(dot(S_row_j, r))` — Rademacher PRNG for S rows
+9. Store: `{d_norm, gamma, s, idx[128], qjl[128]}`
 
-### TurboQuant_prod dequantize:
-1. `x_rot = centroids[idx]`
-2. For each coord j: `x_rot[j] += (sqrt(pi/2)/d) * gamma * S_row_j^T * qjl` — QJL reconstruction
-3. `x_hat = (1/sqrt(d)) * sign_flip * FWHT(x_rot)` — inverse randomized Hadamard
-4. `x = d_norm * x_hat`
+### Dequantize (V path — no QJL, for weighted sums):
+1. `val[j] = s * centroids[idx[j]]` — scaled centroid lookup
+2. `val[j] = sign_flip_undo(val[j])` — undo Rademacher diagonal
+3. `y[j] = d_norm * val[j]`
 
-### Attention-optimized inner product (no full dequant):
-1. Rotate query once: `q_rot = (1/sqrt(d)) * FWHT(sign_flip * q)`
-2. Per cached key: `score = d_norm * (dot(q_rot, centroids[key.idx]) + (sqrt(pi/2)/d) * gamma * dot(S*q_rot, key.qjl))`
+### Fused K·Q dot product (VEC kernel, decode path — with QJL):
+1. `q_sf = sign_flip(q)` — sign-flip query to match K domain
+2. `dot_centroid = sum_j(s * centroid[idx[j]] * q_sf[j])`
+3. `dot_qjl = sum_j(qjl_sign[j] * dot(S_row_j, q_sf))` — QJL IP correction
+4. `score = d_norm * (dot_centroid + sqrt(pi/2)/d * gamma * dot_qjl)`
 
 
 <claude-mem-context>

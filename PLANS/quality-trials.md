@@ -75,11 +75,27 @@ GPU: RTX 3090 (sm_86)
 5. **Asymmetric K/V** (TBQ K + q4_0 V) is the most promising path but blocked by slow
    NC dequant kernel performance.
 
+## Research Findings (Apr 13, 2026)
+
+Thorough research of the TurboQuant paper, QJL reference code, PolarQuant, and community
+implementations (llama.cpp #20969, #21089, 0xSero/turboquant) revealed:
+
+1. **QJL should be dropped entirely** — every practical implementation found MSE-only > MSE+QJL.
+   "QJL adds variance that softmax amplifies." k-bit MSE beats (k-1)-bit MSE + 1-bit QJL.
+2. **Nobody uses TurboQuant for V** — QJL ref code uses 2-bit group quant for V, 0xSero uses
+   group quant, PolarQuant keeps V in fp16. The paper doesn't explicitly recommend TBQ for V.
+3. **The paper doesn't report perplexity** — only LongBench/needle-in-haystack (task-level).
+   PR #21089 got TBQ4 PPL=9.046, matching our 9.53. The gap vs q4_0 is expected.
+4. **Without QJL, TBQ4 gets 16 centroids** (same count as q4_0 levels) — all 4 bits go to
+   Lloyd-Max indices instead of 3-bit + 1-bit QJL. Codebook optimized for N(0,1/d).
+5. **K/V norm asymmetry is huge** — Qwen models have K/V ratio of 100-180x. Single codebook
+   can't serve both. Asymmetric K/V is the standard approach.
+
 ## Recommended Next Steps
 
-1. **Parallelize NC dequant kernel** — use 32+ threads per TBQ block instead of 1. This is
-   purely a CUDA optimization with no algorithm changes. Would unblock Trial 7 and make
-   all TBQ perplexity runs much faster.
-2. **Test asymmetric K/V** once NC kernel is fast — expected to give PPL ~5.5-6.0.
-3. **Value proposition:** TBQ K with fused VEC kernel (fast decode, no K dequant) + q4_0 V
-   (high quality output). Speed benefit from K, quality from V.
+1. **Drop QJL entirely** — repurpose the 1 QJL bit as an additional centroid bit.
+   TBQ3: 2-bit → 3-bit centroids (4→8 levels). TBQ4: 3-bit → 4-bit centroids (8→16 levels).
+   Remove qjl[] from struct, gamma field, QJL PRNG code.
+2. **Use q4_0 for V** — standard group quantization. TBQ K + q4_0 V via VEC kernel.
+3. **Benchmark decode speed** — the fused VEC kernel is TBQ's real differentiator.
+4. **Consider outlier channel handling** — mixed precision for 5-20% outlier channels.
