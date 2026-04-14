@@ -761,86 +761,46 @@ static void dequantize_row_tbq4_0_cuda(const void * vx, dst_t * y, const int64_t
 // dequantize functions as the contiguous path but read source blocks via strides.
 // Strides s01/s02/s03 are in units of TBQ blocks (= type_size bytes each).
 //
-// PRNG seeding: TBQ quantize (set_rows) seeds with block_idx = position within
-// the cache row (0..n_head_kv-1).  FA reads the cache as [head_dim, kv_size, n_heads]
-// with s01 = n_head_kv blocks.  The within-row block position = src_idx % s01.
+// --- TBQ-MSE parallel NC dequant (no QJL, 128 threads per block) ---
+// Each thread handles 1 element: centroid lookup + sign-flip + norm scale.
 
-// Parallel NC dequant: 128 threads per CUDA block, each thread handles 1 element.
-// For no-QJL path (skip_qjl=true): each element is independent, trivially parallel.
-// For QJL path (skip_qjl=false): falls back to single-threaded dequant (thread 0 only).
-
-static __device__ __forceinline__ float tbq_codebook_4_val(int idx) {
-    constexpr float cb[4] = { -1.335033e-01f, -4.002048e-02f, 4.002048e-02f, 1.335033e-01f };
-    return cb[idx];
-}
-
-static __device__ __forceinline__ float tbq_codebook_8_val(int idx) {
-    constexpr float cb[8] = {
-        -1.902069e-01f, -1.187859e-01f, -6.682206e-02f, -2.166347e-02f,
-         2.166347e-02f,  6.682206e-02f,  1.187859e-01f,  1.902069e-01f,
-    };
-    return cb[idx];
-}
-
-template<typename dst_t, bool skip_qjl = false>
+template<typename dst_t>
 static __global__ void k_dequantize_nc_tbq3_0(const void * __restrict__ vx,
                                                 dst_t * __restrict__ y,
                                                 const int64_t ne01,
                                                 const int64_t ne0203, const uint3 ne02_fdv,
                                                 const int64_t s01, const int64_t s02, const int64_t s03) {
     const block_tbq3_0 * src = (const block_tbq3_0 *)vx;
-    const int j = threadIdx.x;  // element index within block (0..127)
+    const int j = threadIdx.x;
 
     for (int64_t i01 = blockIdx.y; i01 < ne01; i01 += gridDim.y) {
         for (int64_t i0203 = blockIdx.z; i0203 < ne0203; i0203 += gridDim.z) {
             const uint2 dm = fast_div_modulo((uint32_t)i0203, ne02_fdv);
-            const int64_t i02 = dm.y;
-            const int64_t i03 = dm.x;
-
-            const int64_t src_idx = i03*s03 + i02*s02 + i01*s01;
-            const int64_t block_in_row = src_idx % s01;
+            const int64_t src_idx = dm.x*s03 + dm.y*s02 + i01*s01;
             const block_tbq3_0 * blk = &src[src_idx];
 
             const float d_norm = __half2float(blk->d);
             const float block_scale = __half2float(blk->s);
 
-            // Centroid lookup for element j
-            const int idx = (blk->idx[j / 4] >> (2 * (j % 4))) & 3;
-            float val = block_scale * tbq_codebook_4_val(idx);
+            // 3-bit centroid lookup
+            int bit_pos = j * 3, byte_pos = bit_pos / 8, bit_off = bit_pos % 8;
+            int idx = (blk->idx[byte_pos] >> bit_off);
+            if (bit_off + 3 > 8) idx |= ((int)blk->idx[byte_pos + 1] << (8 - bit_off));
+            idx &= 7;
+            float val = block_scale * tbq_cb8(idx);
 
-            // QJL reconstruction (only if not skipped — serial fallback)
-            if constexpr (!skip_qjl) {
-                const float gamma = __half2float(blk->gamma);
-                // Each thread computes its own QJL contribution: sum_l S[l][j] * sign[l]
-                float acc = 0.0f;
-                for (int l = 0; l < QK_TBQ; l++) {
-                    float sign = ((blk->qjl[l / 8] >> (l % 8)) & 1) ? 1.0f : -1.0f;
-                    uint64_t srng = tbq_qjl_seed_cuda(block_in_row, l);
-                    // Advance PRNG to position j
-                    for (int m = 0; m <= j; m++) {
-                        srng = tbq_xorshift64_cuda(srng);
-                    }
-                    float s_lj = (srng & 1) ? 1.0f : -1.0f;
-                    acc += s_lj * sign;
-                }
-                val += block_scale * sqrtf((float)M_PI / 2.0f) / (float)QK_TBQ * gamma * acc;
-            }
-
-            // Sign-flip for element j
+            // Sign-flip
+            const int64_t block_in_row = src_idx % s01;
             uint64_t rng = tbq_rot_seed_cuda(block_in_row);
-            for (int m = 0; m <= j; m++) {
-                rng = tbq_xorshift64_cuda(rng);
-            }
+            for (int m = 0; m <= j; m++) rng = tbq_xorshift64_cuda(rng);
             if (rng & 1) val = -val;
 
-            // Scale by norm and write
-            dst_t * y_block = y + (i0203*ne01 + i01) * QK_TBQ;
-            y_block[j] = (dst_t)(d_norm * val);
+            y[(i0203*ne01 + i01) * QK_TBQ + j] = (dst_t)(d_norm * val);
         }
     }
 }
 
-template<typename dst_t, bool skip_qjl = false>
+template<typename dst_t>
 static __global__ void k_dequantize_nc_tbq4_0(const void * __restrict__ vx,
                                                 dst_t * __restrict__ y,
                                                 const int64_t ne01,
@@ -852,52 +812,23 @@ static __global__ void k_dequantize_nc_tbq4_0(const void * __restrict__ vx,
     for (int64_t i01 = blockIdx.y; i01 < ne01; i01 += gridDim.y) {
         for (int64_t i0203 = blockIdx.z; i0203 < ne0203; i0203 += gridDim.z) {
             const uint2 dm = fast_div_modulo((uint32_t)i0203, ne02_fdv);
-            const int64_t i02 = dm.y;
-            const int64_t i03 = dm.x;
-
-            const int64_t src_idx = i03*s03 + i02*s02 + i01*s01;
-            const int64_t block_in_row = src_idx % s01;
+            const int64_t src_idx = dm.x*s03 + dm.y*s02 + i01*s01;
             const block_tbq4_0 * blk = &src[src_idx];
 
             const float d_norm = __half2float(blk->d);
             const float block_scale = __half2float(blk->s);
 
-            // 3-bit centroid lookup for element j
-            const int bit_pos  = j * 3;
-            const int byte_pos = bit_pos / 8;
-            const int bit_off  = bit_pos % 8;
-            int idx = (blk->idx[byte_pos] >> bit_off);
-            if (bit_off + 3 > 8) {
-                idx |= ((int)blk->idx[byte_pos + 1] << (8 - bit_off));
-            }
-            idx &= 7;
-            float val = block_scale * tbq_codebook_8_val(idx);
-
-            // QJL reconstruction
-            if constexpr (!skip_qjl) {
-                const float gamma = __half2float(blk->gamma);
-                float acc = 0.0f;
-                for (int l = 0; l < QK_TBQ; l++) {
-                    float sign = ((blk->qjl[l / 8] >> (l % 8)) & 1) ? 1.0f : -1.0f;
-                    uint64_t srng = tbq_qjl_seed_cuda(block_in_row, l);
-                    for (int m = 0; m <= j; m++) {
-                        srng = tbq_xorshift64_cuda(srng);
-                    }
-                    float s_lj = (srng & 1) ? 1.0f : -1.0f;
-                    acc += s_lj * sign;
-                }
-                val += block_scale * sqrtf((float)M_PI / 2.0f) / (float)QK_TBQ * gamma * acc;
-            }
+            // 4-bit centroid lookup (nibble packed)
+            int idx = (blk->idx[j / 2] >> (4 * (j % 2))) & 0xF;
+            float val = block_scale * tbq_cb16(idx);
 
             // Sign-flip
+            const int64_t block_in_row = src_idx % s01;
             uint64_t rng = tbq_rot_seed_cuda(block_in_row);
-            for (int m = 0; m <= j; m++) {
-                rng = tbq_xorshift64_cuda(rng);
-            }
+            for (int m = 0; m <= j; m++) rng = tbq_xorshift64_cuda(rng);
             if (rng & 1) val = -val;
 
-            dst_t * y_block = y + (i0203*ne01 + i01) * QK_TBQ;
-            y_block[j] = (dst_t)(d_norm * val);
+            y[(i0203*ne01 + i01) * QK_TBQ + j] = (dst_t)(d_norm * val);
         }
     }
 }
@@ -925,31 +856,6 @@ static void dequantize_nc_tbq4_0_cuda(const void * vx, dst_t * y,
     const dim3 num_blocks(1, (int)std::min(ne01, (int64_t)65535),
                              (int)std::min(ne0203, (int64_t)65535));
     k_dequantize_nc_tbq4_0<<<num_blocks, QK_TBQ, 0, stream>>>(
-        vx, y, ne01, ne0203, ne02_fdv, s01, s02, s03);
-}
-
-// No-QJL variants for V dequant (QJL noise hurts weighted sums)
-void dequantize_nc_tbq3_0_noqjl_cuda_f16(const void * vx, half * y,
-        int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
-        int64_t s01, int64_t s02, int64_t s03, cudaStream_t stream) {
-    GGML_ASSERT(ne00 == QK_TBQ);
-    const int64_t ne0203 = ne02 * ne03;
-    const uint3 ne02_fdv = init_fastdiv_values(ne02);
-    const dim3 num_blocks(1, (int)std::min(ne01, (int64_t)65535),
-                             (int)std::min(ne0203, (int64_t)65535));
-    k_dequantize_nc_tbq3_0<half, true><<<num_blocks, QK_TBQ, 0, stream>>>(
-        vx, y, ne01, ne0203, ne02_fdv, s01, s02, s03);
-}
-
-void dequantize_nc_tbq4_0_noqjl_cuda_f16(const void * vx, half * y,
-        int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
-        int64_t s01, int64_t s02, int64_t s03, cudaStream_t stream) {
-    GGML_ASSERT(ne00 == QK_TBQ);
-    const int64_t ne0203 = ne02 * ne03;
-    const uint3 ne02_fdv = init_fastdiv_values(ne02);
-    const dim3 num_blocks(1, (int)std::min(ne01, (int64_t)65535),
-                             (int)std::min(ne0203, (int64_t)65535));
-    k_dequantize_nc_tbq4_0<half, true><<<num_blocks, QK_TBQ, 0, stream>>>(
         vx, y, ne01, ne0203, ne02_fdv, s01, s02, s03);
 }
 

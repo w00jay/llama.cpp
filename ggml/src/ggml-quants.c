@@ -2434,14 +2434,17 @@ static void tbq_fwht_inplace(float * x, int d) {
 }
 
 // Precomputed Lloyd-Max codebooks for N(0, 1/128)
-// 2 centroids (for TBQ3_0: 2-bit index part)
-static const float tbq_codebook_2[2] = { -7.052370e-02f, 7.052370e-02f };
-// 4 centroids (for TBQ3_0: 2-bit index part)
-static const float tbq_codebook_4[4] = { -1.335033e-01f, -4.002048e-02f, 4.002048e-02f, 1.335033e-01f };
-// 8 centroids (for TBQ4_0: 3-bit index part)
+// 8 centroids (for TBQ3_0: 3-bit index)
 static const float tbq_codebook_8[8] = {
     -1.902069e-01f, -1.187859e-01f, -6.682206e-02f, -2.166347e-02f,
      2.166347e-02f,  6.682206e-02f,  1.187859e-01f,  1.902069e-01f,
+};
+// 16 centroids (for TBQ4_0: 4-bit index)
+static const float tbq_codebook_16[16] = {
+    -2.4159188e-01f, -1.8294797e-01f, -1.4308883e-01f, -1.1110441e-01f,
+    -8.3350925e-02f, -5.8095365e-02f, -3.4327652e-02f, -1.1358431e-02f,
+     1.1358431e-02f,  3.4327652e-02f,  5.8095365e-02f,  8.3350925e-02f,
+     1.1110441e-01f,  1.4308883e-01f,  1.8294797e-01f,  2.4159188e-01f,
 };
 
 // Seed for rotation sign-flip (deterministic per block index)
@@ -2449,11 +2452,7 @@ static inline uint64_t tbq_rot_seed(int64_t block_idx) {
     return 0x9E3779B97F4A7C15ULL + (uint64_t)block_idx * 0x6C62272E07BB0142ULL;
 }
 
-// Seed for QJL matrix rows (deterministic per block + coordinate)
-static inline uint64_t tbq_qjl_seed(int64_t block_idx, int coord) {
-    return 0xCAFEBABE00000000ULL + (uint64_t)block_idx * 0x517CC1B727220A95ULL
-         + (uint64_t)coord * 0x6364136223846793ULL;
-}
+// --- TBQ3_0: 3-bit Lloyd-Max MSE (8 centroids, no QJL) ---
 
 void quantize_row_tbq3_0_ref(const float * GGML_RESTRICT x, block_tbq3_0 * GGML_RESTRICT y, int64_t k) {
     assert(k % QK_TBQ == 0);
@@ -2463,81 +2462,51 @@ void quantize_row_tbq3_0_ref(const float * GGML_RESTRICT x, block_tbq3_0 * GGML_
         const float * xb = x + i * QK_TBQ;
         float tmp[QK_TBQ];
 
-        // Step 1: compute norm
+        // Step 1: norm
         float norm = 0.0f;
-        for (int j = 0; j < QK_TBQ; j++) {
-            norm += xb[j] * xb[j];
-        }
+        for (int j = 0; j < QK_TBQ; j++) norm += xb[j] * xb[j];
         norm = sqrtf(norm);
         y[i].d = GGML_FP32_TO_FP16(norm);
 
-        // Step 2: normalize + random sign-flip (completes SRHT with external WHT)
+        // Step 2: normalize + sign-flip
         float inv_norm = (norm > 1e-10f) ? 1.0f / norm : 0.0f;
-        for (int j = 0; j < QK_TBQ; j++) {
-            tmp[j] = xb[j] * inv_norm;
-        }
+        for (int j = 0; j < QK_TBQ; j++) tmp[j] = xb[j] * inv_norm;
         uint64_t rng = tbq_rot_seed(i);
         for (int j = 0; j < QK_TBQ; j++) {
             if (tbq_xorshift64(&rng) & 1) tmp[j] = -tmp[j];
         }
 
-        // Step 2b: per-block adaptive scale
-        // Codebook assumes coords ~ N(0, 1/d) with std = 1/sqrt(d).
-        // Compute actual RMS and scale coords so they match codebook distribution.
+        // Step 3: per-block scale
         float sum_sq = 0.0f;
-        for (int j = 0; j < QK_TBQ; j++) {
-            sum_sq += tmp[j] * tmp[j];
-        }
+        for (int j = 0; j < QK_TBQ; j++) sum_sq += tmp[j] * tmp[j];
         float actual_rms = sqrtf(sum_sq / (float)QK_TBQ);
-        float expected_rms = 1.0f / sqrtf((float)QK_TBQ);  // sqrt(1/d) for unit vector
+        float expected_rms = 1.0f / sqrtf((float)QK_TBQ);
         float block_scale = (actual_rms > 1e-10f) ? actual_rms / expected_rms : 1.0f;
-        float inv_scale = 1.0f / block_scale;
         y[i].s = GGML_FP32_TO_FP16(block_scale);
-        for (int j = 0; j < QK_TBQ; j++) {
-            tmp[j] *= inv_scale;
-        }
+        float inv_scale = 1.0f / block_scale;
+        for (int j = 0; j < QK_TBQ; j++) tmp[j] *= inv_scale;
 
-        // Step 3: nearest centroid (2-bit = 4 centroids)
+        // Step 4: nearest centroid (3-bit = 8 centroids)
         memset(y[i].idx, 0, sizeof(y[i].idx));
-        float centroid_vals[QK_TBQ];
         for (int j = 0; j < QK_TBQ; j++) {
             int best = 0;
-            float best_dist = fabsf(tmp[j] - tbq_codebook_4[0]);
-            for (int c = 1; c < 4; c++) {
-                float dist = fabsf(tmp[j] - tbq_codebook_4[c]);
+            float best_dist = fabsf(tmp[j] - tbq_codebook_8[0]);
+            for (int c = 1; c < 8; c++) {
+                float dist = fabsf(tmp[j] - tbq_codebook_8[c]);
                 if (dist < best_dist) { best_dist = dist; best = c; }
             }
-            // Pack 2-bit index: 4 indices per byte
-            y[i].idx[j / 4] |= (uint8_t)(best << (2 * (j % 4)));
-            centroid_vals[j] = tbq_codebook_4[best];
-        }
-
-        // Step 4: residual (in scaled domain)
-        float residual[QK_TBQ];
-        float gamma_sq = 0.0f;
-        for (int j = 0; j < QK_TBQ; j++) {
-            residual[j] = tmp[j] - centroid_vals[j];
-            gamma_sq += residual[j] * residual[j];
-        }
-        float gamma = sqrtf(gamma_sq);
-        y[i].gamma = GGML_FP32_TO_FP16(gamma);
-
-        // Step 5: QJL sign bits
-        memset(y[i].qjl, 0, sizeof(y[i].qjl));
-        for (int j = 0; j < QK_TBQ; j++) {
-            // Generate Rademacher row j, dot with residual
-            uint64_t srng = tbq_qjl_seed(i, j);
-            float proj = 0.0f;
-            for (int l = 0; l < QK_TBQ; l++) {
-                float s = (tbq_xorshift64(&srng) & 1) ? 1.0f : -1.0f;
-                proj += s * residual[l];
-            }
-            if (proj >= 0.0f) {
-                y[i].qjl[j / 8] |= (1 << (j % 8));
+            int bit_pos = j * 3;
+            int byte_pos = bit_pos / 8;
+            int bit_off = bit_pos % 8;
+            y[i].idx[byte_pos] |= (uint8_t)(best << bit_off);
+            if (bit_off + 3 > 8) {
+                y[i].idx[byte_pos + 1] |= (uint8_t)(best >> (8 - bit_off));
             }
         }
     }
 }
+
+// --- TBQ4_0: 4-bit Lloyd-Max MSE (16 centroids, no QJL) ---
 
 void quantize_row_tbq4_0_ref(const float * GGML_RESTRICT x, block_tbq4_0 * GGML_RESTRICT y, int64_t k) {
     assert(k % QK_TBQ == 0);
@@ -2547,83 +2516,46 @@ void quantize_row_tbq4_0_ref(const float * GGML_RESTRICT x, block_tbq4_0 * GGML_
         const float * xb = x + i * QK_TBQ;
         float tmp[QK_TBQ];
 
-        // Step 1: compute norm
+        // Step 1: norm
         float norm = 0.0f;
-        for (int j = 0; j < QK_TBQ; j++) {
-            norm += xb[j] * xb[j];
-        }
+        for (int j = 0; j < QK_TBQ; j++) norm += xb[j] * xb[j];
         norm = sqrtf(norm);
         y[i].d = GGML_FP32_TO_FP16(norm);
 
-        // Step 2: normalize + random sign-flip (completes SRHT with external WHT)
+        // Step 2: normalize + sign-flip
         float inv_norm = (norm > 1e-10f) ? 1.0f / norm : 0.0f;
-        for (int j = 0; j < QK_TBQ; j++) {
-            tmp[j] = xb[j] * inv_norm;
-        }
+        for (int j = 0; j < QK_TBQ; j++) tmp[j] = xb[j] * inv_norm;
         uint64_t rng = tbq_rot_seed(i);
         for (int j = 0; j < QK_TBQ; j++) {
             if (tbq_xorshift64(&rng) & 1) tmp[j] = -tmp[j];
         }
 
-        // Step 2b: per-block adaptive scale
+        // Step 3: per-block scale
         float sum_sq = 0.0f;
-        for (int j = 0; j < QK_TBQ; j++) {
-            sum_sq += tmp[j] * tmp[j];
-        }
+        for (int j = 0; j < QK_TBQ; j++) sum_sq += tmp[j] * tmp[j];
         float actual_rms = sqrtf(sum_sq / (float)QK_TBQ);
         float expected_rms = 1.0f / sqrtf((float)QK_TBQ);
         float block_scale = (actual_rms > 1e-10f) ? actual_rms / expected_rms : 1.0f;
-        float inv_scale = 1.0f / block_scale;
         y[i].s = GGML_FP32_TO_FP16(block_scale);
-        for (int j = 0; j < QK_TBQ; j++) {
-            tmp[j] *= inv_scale;
-        }
+        float inv_scale = 1.0f / block_scale;
+        for (int j = 0; j < QK_TBQ; j++) tmp[j] *= inv_scale;
 
-        // Step 3: nearest centroid (3-bit = 8 centroids)
+        // Step 4: nearest centroid (4-bit = 16 centroids)
         memset(y[i].idx, 0, sizeof(y[i].idx));
-        float centroid_vals[QK_TBQ];
         for (int j = 0; j < QK_TBQ; j++) {
             int best = 0;
-            float best_dist = fabsf(tmp[j] - tbq_codebook_8[0]);
-            for (int c = 1; c < 8; c++) {
-                float dist = fabsf(tmp[j] - tbq_codebook_8[c]);
+            float best_dist = fabsf(tmp[j] - tbq_codebook_16[0]);
+            for (int c = 1; c < 16; c++) {
+                float dist = fabsf(tmp[j] - tbq_codebook_16[c]);
                 if (dist < best_dist) { best_dist = dist; best = c; }
             }
-            // Pack 3-bit index
-            int bit_pos = j * 3;
-            int byte_pos = bit_pos / 8;
-            int bit_off = bit_pos % 8;
-            y[i].idx[byte_pos] |= (uint8_t)(best << bit_off);
-            if (bit_off + 3 > 8) {
-                y[i].idx[byte_pos + 1] |= (uint8_t)(best >> (8 - bit_off));
-            }
-            centroid_vals[j] = tbq_codebook_8[best];
-        }
-
-        // Step 4: residual (in scaled domain)
-        float residual[QK_TBQ];
-        float gamma_sq = 0.0f;
-        for (int j = 0; j < QK_TBQ; j++) {
-            residual[j] = tmp[j] - centroid_vals[j];
-            gamma_sq += residual[j] * residual[j];
-        }
-        y[i].gamma = GGML_FP32_TO_FP16(sqrtf(gamma_sq));
-
-        // Step 5: QJL sign bits
-        memset(y[i].qjl, 0, sizeof(y[i].qjl));
-        for (int j = 0; j < QK_TBQ; j++) {
-            uint64_t srng = tbq_qjl_seed(i, j);
-            float proj = 0.0f;
-            for (int l = 0; l < QK_TBQ; l++) {
-                float s = (tbq_xorshift64(&srng) & 1) ? 1.0f : -1.0f;
-                proj += s * residual[l];
-            }
-            if (proj >= 0.0f) {
-                y[i].qjl[j / 8] |= (1 << (j % 8));
-            }
+            // Pack 4-bit index: 2 per byte
+            y[i].idx[j / 2] |= (uint8_t)(best << (4 * (j % 2)));
         }
     }
 }
+
+// --- Dequantize ---
 
 void dequantize_row_tbq3_0(const block_tbq3_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     assert(k % QK_TBQ == 0);
@@ -2631,62 +2563,10 @@ void dequantize_row_tbq3_0(const block_tbq3_0 * GGML_RESTRICT x, float * GGML_RE
 
     for (int64_t i = 0; i < nb; i++) {
         const float d_norm = GGML_FP16_TO_FP32(x[i].d);
-        const float gamma  = GGML_FP16_TO_FP32(x[i].gamma);
         const float block_scale = GGML_FP16_TO_FP32(x[i].s);
+
+        // Step 1: centroid lookup (3-bit = 8 centroids), scaled
         float tmp[QK_TBQ];
-
-        // Step 1: reconstruct from 2-bit centroid indices, scaled by per-block scale
-        for (int j = 0; j < QK_TBQ; j++) {
-            int idx = (x[i].idx[j / 4] >> (2 * (j % 4))) & 3;
-            tmp[j] = block_scale * tbq_codebook_4[idx];
-        }
-
-        // Step 2: add QJL reconstruction (also scaled)
-        float qjl_scale = block_scale * sqrtf((float)M_PI / 2.0f) / (float)QK_TBQ * gamma;
-        for (int j = 0; j < QK_TBQ; j++) {
-            // Compute (S^T * qjl_signs)[j] = sum_l S[l][j] * sign[l]
-            float acc = 0.0f;
-            for (int l = 0; l < QK_TBQ; l++) {
-                int sign = ((x[i].qjl[l / 8] >> (l % 8)) & 1) ? 1 : -1;
-                uint64_t srng = tbq_qjl_seed(i, l);
-                // We need element j of row l
-                // Generate j+1 elements and take the last one
-                // Optimization: generate all d elements and pick j-th
-                float s_lj;
-                // Fast path: generate all elements but only use index j
-                uint64_t srng_copy = srng;
-                for (int m = 0; m <= j; m++) {
-                    s_lj = (tbq_xorshift64(&srng_copy) & 1) ? 1.0f : -1.0f;
-                }
-                acc += s_lj * (float)sign;
-            }
-            tmp[j] += qjl_scale * acc;
-        }
-
-        // Step 3: undo sign-flip (D² = I)
-        uint64_t rng = tbq_rot_seed(i);
-        for (int j = 0; j < QK_TBQ; j++) {
-            if (tbq_xorshift64(&rng) & 1) tmp[j] = -tmp[j];
-        }
-
-        // Step 4: scale by norm
-        for (int j = 0; j < QK_TBQ; j++) {
-            y[i * QK_TBQ + j] = d_norm * tmp[j];
-        }
-    }
-}
-
-void dequantize_row_tbq4_0(const block_tbq4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
-    assert(k % QK_TBQ == 0);
-    const int64_t nb = k / QK_TBQ;
-
-    for (int64_t i = 0; i < nb; i++) {
-        const float d_norm = GGML_FP16_TO_FP32(x[i].d);
-        const float gamma  = GGML_FP16_TO_FP32(x[i].gamma);
-        const float block_scale = GGML_FP16_TO_FP32(x[i].s);
-        float tmp[QK_TBQ];
-
-        // Step 1: reconstruct from 3-bit centroid indices, scaled
         for (int j = 0; j < QK_TBQ; j++) {
             int bit_pos = j * 3;
             int byte_pos = bit_pos / 8;
@@ -2699,30 +2579,41 @@ void dequantize_row_tbq4_0(const block_tbq4_0 * GGML_RESTRICT x, float * GGML_RE
             tmp[j] = block_scale * tbq_codebook_8[idx];
         }
 
-        // Step 2: add QJL reconstruction (scaled)
-        float qjl_scale = block_scale * sqrtf((float)M_PI / 2.0f) / (float)QK_TBQ * gamma;
-        for (int j = 0; j < QK_TBQ; j++) {
-            float acc = 0.0f;
-            for (int l = 0; l < QK_TBQ; l++) {
-                int sign = ((x[i].qjl[l / 8] >> (l % 8)) & 1) ? 1 : -1;
-                uint64_t srng = tbq_qjl_seed(i, l);
-                float s_lj;
-                uint64_t srng_copy = srng;
-                for (int m = 0; m <= j; m++) {
-                    s_lj = (tbq_xorshift64(&srng_copy) & 1) ? 1.0f : -1.0f;
-                }
-                acc += s_lj * (float)sign;
-            }
-            tmp[j] += qjl_scale * acc;
-        }
-
-        // Step 3: undo sign-flip (D² = I)
+        // Step 2: undo sign-flip
         uint64_t rng = tbq_rot_seed(i);
         for (int j = 0; j < QK_TBQ; j++) {
             if (tbq_xorshift64(&rng) & 1) tmp[j] = -tmp[j];
         }
 
-        // Step 4: scale by norm
+        // Step 3: scale by norm
+        for (int j = 0; j < QK_TBQ; j++) {
+            y[i * QK_TBQ + j] = d_norm * tmp[j];
+        }
+    }
+}
+
+void dequantize_row_tbq4_0(const block_tbq4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TBQ == 0);
+    const int64_t nb = k / QK_TBQ;
+
+    for (int64_t i = 0; i < nb; i++) {
+        const float d_norm = GGML_FP16_TO_FP32(x[i].d);
+        const float block_scale = GGML_FP16_TO_FP32(x[i].s);
+
+        // Step 1: centroid lookup (4-bit = 16 centroids), scaled
+        float tmp[QK_TBQ];
+        for (int j = 0; j < QK_TBQ; j++) {
+            int idx = (x[i].idx[j / 2] >> (4 * (j % 2))) & 0xF;
+            tmp[j] = block_scale * tbq_codebook_16[idx];
+        }
+
+        // Step 2: undo sign-flip
+        uint64_t rng = tbq_rot_seed(i);
+        for (int j = 0; j < QK_TBQ; j++) {
+            if (tbq_xorshift64(&rng) & 1) tmp[j] = -tmp[j];
+        }
+
+        // Step 3: scale by norm
         for (int j = 0; j < QK_TBQ; j++) {
             y[i * QK_TBQ + j] = d_norm * tmp[j];
         }

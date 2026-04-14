@@ -294,10 +294,15 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
-    // TBQ types: fused K·Q dot product in VEC, V pre-converted to f16.
+    // TBQ types: fused K·Q dot product in VEC.
     // Only D=128 (TBQ block size = head dimension).
+    // V can be TBQ (pre-converted to f16) or q4_0/q8_0 (native VEC dequant).
     FATTN_VEC_CASE(128, GGML_TYPE_TBQ3_0, GGML_TYPE_F16)
     FATTN_VEC_CASE(128, GGML_TYPE_TBQ4_0, GGML_TYPE_F16)
+    FATTN_VEC_CASE(128, GGML_TYPE_TBQ3_0, GGML_TYPE_Q4_0)
+    FATTN_VEC_CASE(128, GGML_TYPE_TBQ4_0, GGML_TYPE_Q4_0)
+    FATTN_VEC_CASE(128, GGML_TYPE_TBQ3_0, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASE(128, GGML_TYPE_TBQ4_0, GGML_TYPE_Q8_0)
 
     GGML_ABORT("fatal error");
 }
@@ -407,9 +412,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 return BEST_FATTN_KERNEL_NONE;
             }
             // VEC: fused TBQ dot product (no K dequant), best for decode.
-            // Only when V is also TBQ or f16 (VEC has no TBQ K + q4_0 V case).
-            if (Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0 && Q->ne[1] <= 2 &&
-                (V->type == K->type || V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_F32)) {
+            if (Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0 && Q->ne[1] <= 2) {
                 return BEST_FATTN_KERNEL_VEC;
             }
             // Prefill fallback: pre-convert K/V to fp16, use MMA/TILE

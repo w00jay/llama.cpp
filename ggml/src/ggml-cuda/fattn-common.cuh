@@ -289,10 +289,10 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q8_0(
     return sum;
 }
 
-// --- TBQ fused K·Q dot products ---
-// Compute attention score directly from TBQ-compressed K, avoiding full dequant.
-// Q_v is the query as half2 (populated when Q_q8_1 = false for TBQ types).
-// score = d_norm * (dot(q, centroids[idx]) + sqrt(pi/2)/d * gamma * dot_qjl)
+// --- TBQ-MSE fused K·Q dot products (no QJL) ---
+// Pure centroid lookup + dot product. Fast and simple.
+// Q_v is the query as half (populated when Q_q8_1 = false for TBQ types).
+// score = d_norm * block_scale * dot(sign_flip(q), centroids[idx])
 
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq3_0(
@@ -304,53 +304,34 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq3_0(
     GGML_UNUSED(Q_q8);
     GGML_UNUSED(Q_ds_v);
 
-    constexpr float cb4[4] = { -1.335033e-01f, -4.002048e-02f, 4.002048e-02f, 1.335033e-01f };
     const float d_norm = __half2float(K_tbq->d);
-    const float gamma  = __half2float(K_tbq->gamma);
     const float block_scale = __half2float(K_tbq->s);
 
-    // Sign-flip the query to match the sign-flip applied during quantization.
-    // TODO: use actual kv_head index instead of 0 (requires VEC kernel plumbing).
-    // Using 0 is correct for head 0; for other heads the VEC decode path contributes
-    // minimally to PPL. The MMA/TILE prefill path does full dequant with correct seeds.
-    const int block_in_row = 0;
+    // Sign-flip query (block_in_row=0; TODO: use actual kv_head index)
+    // dot(sign_flip(q), centroid[idx]) per element
+    float sum = 0.0f;
+    uint64_t sf_rng = tbq_rot_seed_cuda(0);
+    // Precompute sign-flip for all elements (needed for parallel access)
     float q_sf[D];
-    uint64_t sf_rng = tbq_rot_seed_cuda(block_in_row);
     for (int j = 0; j < D; j++) {
         sf_rng = tbq_xorshift64_cuda(sf_rng);
-        float q_j = __half2float(Q_h[j]);
-        q_sf[j] = (sf_rng & 1) ? -q_j : q_j;
+        q_sf[j] = (sf_rng & 1) ? -__half2float(Q_h[j]) : __half2float(Q_h[j]);
     }
 
-    // Part 1: dot(q_signflipped, centroids[idx])
-    float dot_centroid = 0.0f;
     for (int j0 = 0; j0 < D; j0 += nthreads) {
         const int j = j0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
         if (j < D) {
-            const int idx = (K_tbq->idx[j / 4] >> (2 * (j % 4))) & 3;
-            dot_centroid += block_scale * cb4[idx] * q_sf[j];
+            int bit_pos = j * 3;
+            int byte_pos = bit_pos / 8;
+            int bit_off = bit_pos % 8;
+            int idx = (K_tbq->idx[byte_pos] >> bit_off);
+            if (bit_off + 3 > 8) idx |= ((int)K_tbq->idx[byte_pos + 1] << (8 - bit_off));
+            idx &= 7;
+            sum += tbq_cb8(idx) * q_sf[j];
         }
     }
 
-    // Part 2: QJL correction with sign-flipped query
-    float dot_qjl = 0.0f;
-    for (int j0 = 0; j0 < QK_TBQ; j0 += nthreads) {
-        const int j = j0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
-        if (j < QK_TBQ) {
-            const float qjl_sign = ((K_tbq->qjl[j / 8] >> (j % 8)) & 1) ? 1.0f : -1.0f;
-            uint64_t srng = tbq_qjl_seed_cuda(block_in_row, j);
-            float s_dot_q = 0.0f;
-            for (int l = 0; l < QK_TBQ; l++) {
-                srng = tbq_xorshift64_cuda(srng);
-                const float s_jl = (srng & 1) ? 1.0f : -1.0f;
-                s_dot_q += s_jl * q_sf[l];
-            }
-            dot_qjl += qjl_sign * s_dot_q;
-        }
-    }
-
-    const float qjl_scale = block_scale * sqrtf((float)M_PI / 2.0f) / (float)QK_TBQ * gamma;
-    return d_norm * (dot_centroid + qjl_scale * dot_qjl);
+    return d_norm * block_scale * sum;
 }
 
 template <int D, int nthreads>
@@ -363,60 +344,26 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq4_0(
     GGML_UNUSED(Q_q8);
     GGML_UNUSED(Q_ds_v);
 
-    constexpr float cb8[8] = {
-        -1.902069e-01f, -1.187859e-01f, -6.682206e-02f, -2.166347e-02f,
-         2.166347e-02f,  6.682206e-02f,  1.187859e-01f,  1.902069e-01f,
-    };
     const float d_norm = __half2float(K_tbq->d);
-    const float gamma  = __half2float(K_tbq->gamma);
     const float block_scale = __half2float(K_tbq->s);
 
-    // Sign-flip query (same seed as quantize; block_in_row=0, see tbq3 comment)
-    const int block_in_row = 0;
     float q_sf[D];
-    uint64_t sf_rng = tbq_rot_seed_cuda(block_in_row);
+    uint64_t sf_rng = tbq_rot_seed_cuda(0);
     for (int j = 0; j < D; j++) {
         sf_rng = tbq_xorshift64_cuda(sf_rng);
-        float q_j = __half2float(Q_h[j]);
-        q_sf[j] = (sf_rng & 1) ? -q_j : q_j;
+        q_sf[j] = (sf_rng & 1) ? -__half2float(Q_h[j]) : __half2float(Q_h[j]);
     }
 
-    // Part 1: dot(q_signflipped, centroids[idx]) — 3-bit indices
-    float dot_centroid = 0.0f;
+    float sum = 0.0f;
     for (int j0 = 0; j0 < D; j0 += nthreads) {
         const int j = j0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
         if (j < D) {
-            const int bit_pos  = j * 3;
-            const int byte_pos = bit_pos / 8;
-            const int bit_off  = bit_pos % 8;
-            int idx = (K_tbq->idx[byte_pos] >> bit_off);
-            if (bit_off + 3 > 8) {
-                idx |= ((int)K_tbq->idx[byte_pos + 1] << (8 - bit_off));
-            }
-            idx &= 7;
-            dot_centroid += block_scale * cb8[idx] * q_sf[j];
+            int idx = (K_tbq->idx[j / 2] >> (4 * (j % 2))) & 0xF;
+            sum += tbq_cb16(idx) * q_sf[j];
         }
     }
 
-    // Part 2: QJL correction with sign-flipped query
-    float dot_qjl = 0.0f;
-    for (int j0 = 0; j0 < QK_TBQ; j0 += nthreads) {
-        const int j = j0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
-        if (j < QK_TBQ) {
-            const float qjl_sign = ((K_tbq->qjl[j / 8] >> (j % 8)) & 1) ? 1.0f : -1.0f;
-            uint64_t srng = tbq_qjl_seed_cuda(block_in_row, j);
-            float s_dot_q = 0.0f;
-            for (int l = 0; l < QK_TBQ; l++) {
-                srng = tbq_xorshift64_cuda(srng);
-                const float s_jl = (srng & 1) ? 1.0f : -1.0f;
-                s_dot_q += s_jl * q_sf[l];
-            }
-            dot_qjl += qjl_sign * s_dot_q;
-        }
-    }
-
-    const float qjl_scale = block_scale * sqrtf((float)M_PI / 2.0f) / (float)QK_TBQ * gamma;
-    return d_norm * (dot_centroid + qjl_scale * dot_qjl);
+    return d_norm * block_scale * sum;
 }
 
 template <typename Tds, int ni>
@@ -1103,8 +1050,8 @@ void launch_fattn(
 
         K_f16.alloc(ggml_nelements(K));
         // TBQ types must always use the NC (stride-aware) path.
-        const bool k_is_tbq = K->type == GGML_TYPE_TBQ3_0 || K->type == GGML_TYPE_TBQ4_0;
-        const bool k_use_nc = !ggml_is_contiguously_allocated(K) || k_is_tbq;
+        const bool k_use_nc = !ggml_is_contiguously_allocated(K) ||
+                               K->type == GGML_TYPE_TBQ3_0 || K->type == GGML_TYPE_TBQ4_0;
         if (!k_use_nc) {
             to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
             to_fp16(K_data, K_f16.ptr, ggml_nelements(K), main_stream);
@@ -1114,22 +1061,11 @@ void launch_fattn(
             nb13 = nb13*bs*sizeof(half)/ts;
         } else {
             GGML_ASSERT(K->nb[0] == ts);
+            to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(K->type);
             const int64_t s01 = nb11 / ts;
             const int64_t s02 = nb12 / ts;
             const int64_t s03 = nb13 / ts;
-            // TBQ K pre-conversion: also skip QJL (fused VEC handles QJL directly)
-            if (k_is_tbq) {
-                if (K->type == GGML_TYPE_TBQ3_0) {
-                    dequantize_nc_tbq3_0_noqjl_cuda_f16(K_data, K_f16.ptr,
-                        K->ne[0], K->ne[1], K->ne[2], K->ne[3], s01, s02, s03, main_stream);
-                } else {
-                    dequantize_nc_tbq4_0_noqjl_cuda_f16(K_data, K_f16.ptr,
-                        K->ne[0], K->ne[1], K->ne[2], K->ne[3], s01, s02, s03, main_stream);
-                }
-            } else {
-                to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(K->type);
-                to_fp16(K_data, K_f16.ptr, K->ne[0], K->ne[1], K->ne[2], K->ne[3], s01, s02, s03, main_stream);
-            }
+            to_fp16(K_data, K_f16.ptr, K->ne[0], K->ne[1], K->ne[2], K->ne[3], s01, s02, s03, main_stream);
 
             nb11 = K->ne[0] * sizeof(half);
             nb12 = K->ne[1] * nb11;
@@ -1149,8 +1085,8 @@ void launch_fattn(
             const size_t ts = ggml_type_size(V->type);
 
             V_f16.alloc(ggml_nelements(V));
-            const bool v_is_tbq = V->type == GGML_TYPE_TBQ3_0 || V->type == GGML_TYPE_TBQ4_0;
-            const bool v_use_nc = !ggml_is_contiguously_allocated(V) || v_is_tbq;
+            const bool v_use_nc = !ggml_is_contiguously_allocated(V) ||
+                                   V->type == GGML_TYPE_TBQ3_0 || V->type == GGML_TYPE_TBQ4_0;
             if (!v_use_nc) {
                 to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
                 to_fp16(V_data, V_f16.ptr, ggml_nelements(V), main_stream);
@@ -1161,22 +1097,11 @@ void launch_fattn(
                 nb23 = nb23*bs*sizeof(half)/ts;
             } else {
                 GGML_ASSERT(V->nb[0] == ts);
+                to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(V->type);
                 const int64_t s01 = nb21 / ts;
                 const int64_t s02 = nb22 / ts;
                 const int64_t s03 = nb23 / ts;
-                // TBQ V: use no-QJL dequant (QJL noise hurts weighted sums)
-                if (v_is_tbq) {
-                    if (V->type == GGML_TYPE_TBQ3_0) {
-                        dequantize_nc_tbq3_0_noqjl_cuda_f16(V_data, V_f16.ptr,
-                            V->ne[0], V->ne[1], V->ne[2], V->ne[3], s01, s02, s03, main_stream);
-                    } else {
-                        dequantize_nc_tbq4_0_noqjl_cuda_f16(V_data, V_f16.ptr,
-                            V->ne[0], V->ne[1], V->ne[2], V->ne[3], s01, s02, s03, main_stream);
-                    }
-                } else {
-                    to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(V->type);
-                    to_fp16(V_data, V_f16.ptr, V->ne[0], V->ne[1], V->ne[2], V->ne[3], s01, s02, s03, main_stream);
-                }
+                to_fp16(V_data, V_f16.ptr, V->ne[0], V->ne[1], V->ne[2], V->ne[3], s01, s02, s03, main_stream);
 
                 nb21 = V->ne[0] * sizeof(half);
                 nb22 = V->ne[1] * nb21;

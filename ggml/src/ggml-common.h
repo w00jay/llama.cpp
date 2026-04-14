@@ -181,27 +181,25 @@ typedef struct {
 } block_q1_0;
 static_assert(sizeof(block_q1_0) == sizeof(ggml_half) + QK1_0 / 8, "wrong q1_0 block size/padding");
 
-// TurboQuant blocks: d=128 values per block
-// TBQ3_0: 3 bits/coord = 2-bit Lloyd-Max index + 1-bit QJL sign
+// TurboQuant-MSE blocks: d=128 values per block, all bits for Lloyd-Max centroids (no QJL)
 #define QK_TBQ 128
-typedef struct {
-    ggml_half d;              // vector norm ||x||
-    ggml_half gamma;          // residual norm ||r||
-    ggml_half s;              // per-block scale: actual_std / codebook_std
-    uint8_t   idx[QK_TBQ/4]; // 2-bit centroid indices, packed 4 per byte (32 bytes)
-    uint8_t   qjl[QK_TBQ/8]; // 1-bit QJL signs, packed 8 per byte (16 bytes)
-} block_tbq3_0;
-static_assert(sizeof(block_tbq3_0) == 3 * sizeof(ggml_half) + QK_TBQ/4 + QK_TBQ/8, "wrong tbq3_0 block size/padding");
-
-// TBQ4_0: 4 bits/coord = 3-bit Lloyd-Max index + 1-bit QJL sign
+// TBQ3_0: 3-bit Lloyd-Max (8 centroids) = 3.25 bpw
 typedef struct {
     ggml_half d;                // vector norm ||x||
-    ggml_half gamma;            // residual norm ||r||
-    ggml_half s;                // per-block scale: actual_std / codebook_std
+    ggml_half s;                // per-block scale: actual_rms / expected_rms
     uint8_t   idx[3*QK_TBQ/8]; // 3-bit centroid indices, packed (48 bytes)
-    uint8_t   qjl[QK_TBQ/8];   // 1-bit QJL signs, packed 8 per byte (16 bytes)
+} block_tbq3_0;
+static_assert(sizeof(block_tbq3_0) == 2 * sizeof(ggml_half) + 3*QK_TBQ/8, "wrong tbq3_0 block size/padding");
+// 2 + 2 + 48 = 52 bytes for 128 values = 3.25 bpw
+
+// TBQ4_0: 4-bit Lloyd-Max (16 centroids) = 4.25 bpw
+typedef struct {
+    ggml_half d;              // vector norm ||x||
+    ggml_half s;              // per-block scale: actual_rms / expected_rms
+    uint8_t   idx[QK_TBQ/2]; // 4-bit centroid indices, packed 2 per byte (64 bytes)
 } block_tbq4_0;
-static_assert(sizeof(block_tbq4_0) == 3 * sizeof(ggml_half) + 3*QK_TBQ/8 + QK_TBQ/8, "wrong tbq4_0 block size/padding");
+static_assert(sizeof(block_tbq4_0) == 2 * sizeof(ggml_half) + QK_TBQ/2, "wrong tbq4_0 block size/padding");
+// 2 + 2 + 64 = 68 bytes for 128 values = 4.25 bpw
 
 #define QK4_0 32
 typedef struct {
